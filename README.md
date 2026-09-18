@@ -399,9 +399,17 @@ v5](https://github.com/FIDEScommunity/DIIP/blob/main/spec/spec.md). See
 [DIIP-V5.md](DIIP-V5.md) for the requirement-by-requirement matrix and how to exercise each
 part locally.
 
-The dev stack runs with `DID_KEY_VERSION=jwk` so holder keys are `did:jwk`, as DIIP v5
-requires. Set it to `jwk_jcs-pub` or `p256-pub` in `docker-compose.test.yml` to exercise the
-legacy `did:key` behaviour.
+The wallet defaults to the **HAIP** profile, which binds the Holder's raw key — the proof
+shape every SIROS issuer accepts today. DIIP is opt-in, so this stack sets
+`INTEROP_PROFILE=diip` in `docker-compose.test.yml` and holder keys are `did:jwk`; drop that
+line to get the default back. `DID_KEY_VERSION` then selects which `did:key` flavour a HAIP
+wallet mints, and is ignored under DIIP.
+
+An Issuer that publishes `cryptographic_binding_methods_supported` on a credential
+configuration overrides both — `vc` advertises `["jwk"]` unconfigured and
+`["did:jwk", "jwk"]` once configured — so negotiation, not the local setting, is normally what
+decides. That path needs the engine to forward the field first; see
+[DIIP-V5.md](DIIP-V5.md).
 
 DIIP mandates the IETF Token Status List for revocation, and `vc-registry` publishes real ones
 under `make up VC=yes` — no fixture needed. It implements the draft directly, signing tokens

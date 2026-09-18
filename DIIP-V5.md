@@ -49,9 +49,20 @@ codebase already used for legacy SD-JWT VC. The two are distinguished by payload
 | --- | --- | --- |
 | MUST support did:jwk and did:web for Issuers, Holders, Verifiers | ⚠️ | `wallet-common/src/resolvers/didResolver.ts`; holder keys in `wallet-frontend/src/services/keystore.ts` (`createDidJwk`). Resolution works for all three roles; *trusting* a did:jwk Verifier does not — see [Known gap: did:jwk Verifiers](#known-gap-didjwk-verifiers) |
 
-`DID_KEY_VERSION` selects how holder keys are identified. It defaults to `jwk` (did:jwk).
-The earlier `p256-pub` and `jwk_jcs-pub` did:key variants still work, so wallets holding
-credentials bound to a did:key keep functioning — no migration is required.
+How holder keys are identified follows the wallet's interoperability profile, which defaults
+to **HAIP** rather than DIIP: adding DIIP support should not change the proof shape existing
+SIROS issuers already accept, so a DIIP deployment opts in with `INTEROP_PROFILE=diip`. HAIP
+embeds the raw key in the proof header and binds by `cnf.jwk`; DIIP names a `did:jwk` with a
+`kid` into its DID document and binds by `cnf.kid`. `DID_KEY_VERSION` selects which `did:key`
+flavour a HAIP wallet mints, and wallets already holding credentials bound to a `did:key` keep
+working either way — no migration is required.
+
+On top of the profile, `resolveDidKeyVersion`
+(`wallet-frontend/src/lib/interopProfile.ts`) carries the negotiation rule the native SDKs use:
+an Issuer publishing `cryptographic_binding_methods_supported` has said what it accepts, and
+that beats the local preference. **Nothing feeds it yet** — the engine's sign request carries
+`proof_types_supported` but not the binding methods, so the configured profile decides every
+flow until go-wallet-backend forwards that field, the same gap `authorization_details` had.
 
 ### Issuance (OID4VCI 1.0)
 
