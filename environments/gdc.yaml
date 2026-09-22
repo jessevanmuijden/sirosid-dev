@@ -86,7 +86,13 @@ images:
   # was never committed, and it predates the review change that gave #336 its
   # shared refusal description - so it matched neither merged PR. Read out of
   # the image itself on 2026-09-21, the only place it still existed.
-  wallet-backend: ghcr.io/sirosfoundation/go-wallet-backend:0.22.0
+  # 0.22.0 -> 0.22.1: the SSRF address guard on POST /helper/get-cert (#358)
+  # and a recover() that is now registered before the flow_id log truncation,
+  # so a panic in handleFlowStart is caught rather than taking the process
+  # down (#357). The shared default moved to 0.22.1 in the same change; this
+  # pin stays because it is what stopped gdc drifting the last time the
+  # shared one moved under it.
+  wallet-backend: ghcr.io/sirosfoundation/go-wallet-backend:0.22.1
 
 # geneva2026.mdoc.online: the Geneva 2026 interop test event's reference
 # mdoc issuer - trusted here so a wallet can receive a credential from it

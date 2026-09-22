@@ -290,7 +290,18 @@ images:
   # 0.18.2 (rejects every WebAuthn sign-up and login with "Client returned the
   # prf extension output which was not requested") and 0.18.3 (tagged on the
   # wrong commit, same code as 0.18.2).
-  walletBackend: "ghcr.io/sirosfoundation/go-wallet-backend:0.18.4"
+  #
+  # Bumped from 0.18.4 to 0.22.1. Everything between is release history this
+  # default simply never took; what matters to an environment deployed today:
+  #   0.20.0  sign_client_auth, the client-held DPoP key
+  #   0.21.0/0.22.0  the no-matching-credential fast fail (#336) and OpenID4VP
+  #        1.0's `decentralized_identifier` client_id scheme (#343) - without
+  #        the latter a verifier built against the final specification is
+  #        refused before its request is read
+  #   0.22.1  the SSRF address guard on POST /helper/get-cert (#358), and a
+  #        recover() registered before the flow_id log truncation so a panic
+  #        in handleFlowStart is caught rather than taking the process (#357)
+  walletBackend: "ghcr.io/sirosfoundation/go-wallet-backend:0.22.1"
 
   # siros-id-stack's own vc.* pins (values.yaml) are still
   # v0.6.5-sirosid.4, well behind the mdoc/BLE proximity and DC API fixes
