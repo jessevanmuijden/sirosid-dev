@@ -438,6 +438,25 @@ than resolved from a presented PID, which is the whole point of the
 pre-authorized grant. The code expires 5 minutes after minting, so generate
 it when the phone is in your hand.
 
+**The issuer and the verifier show the SUNET logo:** they are showing vc's
+built-in assets, which means `common.branding` never reached them. The chart
+points `logo_path`/`favicon_path` at `/branding-assets/*.png` and expects an
+initContainer to decode them there from the `branding` ConfigMap; there is no
+initContainer here, and vc validates a branding path as a real PNG at startup
+even when it is empty (`panic: validation:image_png field:logo_path`), so the
+whole block used to be stripped. `vc_render.write_branding_assets` now does
+the initContainer's job at render time, writing
+`fixtures/rendered/branding-assets/{logo,favicon}.png`, which compose mounts
+and `fly-up` ships with `--file-local`. Check that directory exists before
+looking anywhere else.
+
+To use something other than the chart's default (the SIROS ball), name a PNG
+in this repo - `features.branding.logoDataUrl: {file: fixtures/...}`, and the
+same for `faviconDataUrl` - in `values-base.yaml` or in an environment's
+`values:` block. The chart's own literal `data:image/png;base64,...` form
+still works; the `{file: ...}` reference is resolved to exactly that before
+the chart sees the values, the same way credential-type documents are.
+
 **vc-apigw's `/api/v1/*` (datastore, identity mappings) answers 401 to a
 plain request - or, before 2026-09-15, answered anything to anyone:** the
 admin API takes a Bearer JWT. The chart renders `api_server.api_auth` (JWKS

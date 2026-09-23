@@ -29,6 +29,7 @@ handled here:
     https->http rewrite patch_wallet_backend_compose() already does is
     applied here for the compose target only.
 """
+import base64
 import re
 import shutil
 import sys
@@ -112,6 +113,63 @@ def inline_file_refs(values: dict, root: Path = None) -> dict:
     return values
 
 
+BRANDING_KEYS = {"logoDataUrl": "logo", "faviconDataUrl": "favicon"}
+
+
+def resolve_branding_refs(values: dict, root: Path = None) -> dict:
+    """Let `features.branding.*DataUrl` name a PNG in this repo.
+
+    The chart takes these as `data:` URLs, which is a fine thing for a chart
+    and a poor thing to hand-maintain: a 25 KB base64 blob in values-base.yaml
+    is unreviewable and undiffable. A `{file: ...}` reference is resolved to
+    the same data URL here, before the chart sees the values, exactly as
+    [inline_file_refs] resolves the document references next to it. A literal
+    data URL still works, and blank still means the chart's own default -
+    which is the SIROS ball.
+    """
+    root = root or SIROSID_DEV_ROOT
+    branding = (values.get("features") or {}).get("branding")
+    if not isinstance(branding, dict):
+        return values
+    for key in BRANDING_KEYS:
+        ref = branding.get(key)
+        if not isinstance(ref, dict) or "file" not in ref:
+            continue
+        path = root / ref["file"]
+        if not path.is_file():
+            raise SystemExit(f"features.branding.{key} references a missing file: {ref['file']}")
+        raw = path.read_bytes()
+        if not raw.startswith(b"\x89PNG\r\n\x1a\n"):
+            # vc validates a branding path as a real PNG at startup, so a JPEG
+            # here is a crash-on-boot rather than a wrong-looking page.
+            raise SystemExit(f"features.branding.{key}: {ref['file']} is not a PNG")
+        branding[key] = "data:image/png;base64," + base64.b64encode(raw).decode()
+    return values
+
+
+def write_branding_assets(docs: list, out_dir: Path) -> Path:
+    """Decode the branding ConfigMap into the PNGs the services mount.
+
+    In-cluster an initContainer does this, reading the same ConfigMap and
+    writing /branding-assets/{logo,favicon}.png. There is no initContainer
+    here, which is why these paths used to be blanked out and both services
+    fell back to vc's built-in assets - the SUNET logo. Doing the decode at
+    render time keeps the chart's own paths intact and needs nothing at run
+    time.
+    """
+    target = out_dir / "branding-assets"
+    data = extract_configmap_data(docs, "branding")
+    if not data:
+        return target
+    target.mkdir(parents=True, exist_ok=True)
+    for key, name in BRANDING_KEYS.items():
+        url = data.get(key) or ""
+        if "," not in url:
+            continue
+        (target / f"{name}.png").write_bytes(base64.b64decode(url.split(",", 1)[1]))
+    return target
+
+
 def expand_presentation_request_templates(values: dict, root: Path = None) -> dict:
     """Turn `verifier.presentationRequestTemplatesFrom: <dir>` into the chart's
     own `verifier.presentationRequestTemplates` map.
@@ -175,24 +233,32 @@ def patch_vc_compose(config: dict, plain_http_hosts: set) -> dict:
 
 
 def strip_unrenderable(config: dict) -> dict:
-    """Drop the block the chart renders for a Kubernetes deployment that vc
-    then refuses to start without the rest of that deployment.
+    """Drop what the chart renders for a Kubernetes deployment that vc then
+    refuses to start without the rest of that deployment.
 
-    It had to be REMOVED rather than overridden, which extraConfig cannot do
-    (mergeOverwrite has no delete). Found by booting the images:
+    Nothing is stripped any more, and the two blocks that used to be say
+    something about the shape of this problem. Both had to be REMOVED rather
+    than overridden, which extraConfig cannot do (mergeOverwrite has no
+    delete), and both were removed because this repo could not supply what
+    the chart assumed a cluster would.
 
     - common.branding points at PNGs a branding initContainer decodes into an
       emptyDir. vc validates a branding path with `image_png`, and that runs
-      even for an empty string, so there is no value that means "no branding":
+      even for an empty string, so there was no value meaning "no branding":
         panic: validation:image_png field:logo_path
+      Stripping it left the issuer and the verifier showing vc's built-in
+      assets, which are SUNET's. vc_render.write_branding_assets now does the
+      initContainer's job at render time, so the chart's own paths stand.
 
-    apigw.api_server.api_auth used to be stripped here as well, on the
-    grounds that nothing could mint an admin JWT - which left the datastore
-    API (upload, search, delete) open on every environment's public URL.
-    scripts/api_auth.py now provides the key and the token, so the chart's
-    block (JWKS bearer auth + the `admin@<tenant>` SPOCP rule) stays.
+    - apigw.api_server.api_auth was stripped on the grounds that nothing here
+      could mint an admin JWT, which left the datastore API (upload, search,
+      delete) open on every environment's public URL. scripts/api_auth.py
+      provides the key and the token, so the chart's block (JWKS bearer auth
+      plus the `admin@<tenant>` SPOCP rule) stays.
+
+    Kept as a named step: the next thing the chart assumes a cluster for
+    belongs here, with its reason, rather than as a silent pop somewhere.
     """
-    (config.get("common") or {}).pop("branding", None)
     return config
 
 
@@ -400,4 +466,5 @@ def render_vc(docs: list, out_dir: Path, target: str, secrets_dir: Path, gen_sec
     # The verifier reads presentation_requests_dir as a directory of template
     # files; the chart renders them into a single pres-reqs.yaml.
     pres = _write_documents(docs, out_dir, "verifier-pres-reqs", "pres-reqs")
-    print(f"wrote {pres}/ , {out_dir / 'vctms'}/ , {out_dir / 'documents'}/")
+    branding = write_branding_assets(docs, out_dir)
+    print(f"wrote {pres}/ , {out_dir / 'vctms'}/ , {out_dir / 'documents'}/ , {branding}/")

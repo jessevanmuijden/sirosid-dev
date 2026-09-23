@@ -811,6 +811,7 @@ def render(target: str, chart_dir: Path, env: str = None, android_apk_key_hashes
 
     base = yaml.safe_load((SIROSID_DEV_ROOT / "values-base.yaml").read_text())
     vc_render.inline_file_refs(base)
+    vc_render.resolve_branding_refs(base)
     vc_render.expand_presentation_request_templates(base)
     base_path = out_dir / "values.base-inlined.yaml"
     base_path.write_text(yaml.dump(base, sort_keys=False))
@@ -876,6 +877,7 @@ def render(target: str, chart_dir: Path, env: str = None, android_apk_key_hashes
         # panicking at startup with "unexpected end of JSON input".
         env_values = copy.deepcopy(env_values)
         vc_render.inline_file_refs(env_values)
+        vc_render.resolve_branding_refs(env_values)
         vc_render.expand_presentation_request_templates(env_values)
         env_values_path = out_dir / "values.environment.yaml"
         env_values_path.write_text(yaml.dump(env_values, sort_keys=False))

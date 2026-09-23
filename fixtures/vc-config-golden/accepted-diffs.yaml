@@ -63,6 +63,15 @@ _shared: &shared
   - path: common.ha.cache_database_name
     reason: "the chart names each service's HA cache database explicitly instead of letting vc default it"
   - path: common.branding
+    reason: >-
+      The golden predates this repo having branding at all: the block used to
+      be stripped, because vc validates a branding path as a real PNG even
+      when it is empty, and nothing here wrote the PNGs an initContainer
+      writes in a cluster. vc_render.write_branding_assets now decodes them
+      from the chart's own branding ConfigMap at render time, so the chart's
+      paths are rendered verbatim and the issuer and verifier show the SIROS
+      ball rather than vc's built-in SUNET assets.
+  - path: common.branding
     reason: "blanked to empty paths in values-base.yaml - vc validates a non-empty branding path as a real PNG at startup"
   - path: common.tracing
     reason: "the chart renders an explicit enable flag (off, features.otlpCollector) rather than an addr with no toggle"

@@ -113,6 +113,9 @@ services:
       - ./fixtures/vc-pki:/pki:ro
       - ./fixtures/rendered/vctms:/vctms:ro
       - ./fixtures/rendered/pres-reqs:/pres-reqs:ro
+      # What the chart's branding initContainer would have written; the
+      # renderer decodes it instead (vc_render.write_branding_assets).
+      - ./fixtures/rendered/branding-assets:/branding-assets:ro
     environment:
       - VC_CONFIG_YAML=/config.yaml
       - SSL_CERT_FILE=/pki/rootCA.crt
@@ -154,6 +157,7 @@ services:
       - ./fixtures/vc-pki:/pki:ro
       - ./fixtures/rendered/vctms:/vctms:ro
       - ./fixtures/rendered/documents:/documents:ro
+      - ./fixtures/rendered/branding-assets:/branding-assets:ro
       # Verification key for the admin/datastore API's Bearer JWTs
       # (api_server.api_auth.jwks.jwks_file_path) - scripts/api_auth.py.
       - ./fixtures/rendered/api_auth_jwks.json:/main-config/api_auth_jwks.json:ro

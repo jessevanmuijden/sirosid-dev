@@ -25,6 +25,25 @@ tenant:
 
 features:
   production: false
+
+  # The logo and favicon the issuer and the verifier show - on their own web
+  # pages, and, for the logo, in the issuer metadata a wallet renders a card
+  # from. Leave both unset for the chart's own default, which is the SIROS
+  # ball; name a PNG in this repo to use something else:
+  #
+  #   branding:
+  #     logoDataUrl: {file: fixtures/branding/logo.png}
+  #     faviconDataUrl: {file: fixtures/branding/favicon.png}
+  #
+  # The chart's own form, a literal `data:image/png;base64,...` string, still
+  # works. Either can be set per environment in environments/<name>.yaml's
+  # `values:` block, which is the point of putting it here rather than
+  # hard-coding an asset.
+  #
+  # vc validates a branding path as a real PNG at startup, so a JPEG is a
+  # crash on boot rather than a wrong-looking page; the renderer checks the
+  # magic bytes and says so before it gets that far.
+  branding: {}
   # Secrets are rendered by render-helm-config.py rather than by the chart's
   # in-cluster secret-generator CronJob; there is no cluster to run it in.
   generateSecrets: false
@@ -268,15 +287,6 @@ issuer:
         - "urn:ietf:params:oauth:grant-type:pre-authorized_code"
         - refresh_token
     extraConfig:
-      common:
-        # The chart points these at PNGs a branding initContainer decodes into
-        # an emptyDir; there is no such container here, and vc validates a
-        # non-empty branding path as a real PNG at startup (image_png), so a
-        # dangling path is a crash, not a missing logo. Blank means vc's own
-        # built-in assets.
-        branding:
-          logo_path: ""
-          favicon_path: ""
       apigw:
         # create-pki.sh generates one EC key/chain per environment; the chart's
         # cert-manager paths (/sign-cert, /sign-cert-chain) have nothing behind
@@ -422,12 +432,6 @@ verifier:
   presentationRequestTemplatesFrom: fixtures/vc-presentation-requests
 
   extraConfig:
-    common:
-      # See the apigw's copy of this - vc validates a non-empty branding path
-      # as a real PNG at startup.
-      branding:
-        logo_path: ""
-        favicon_path: ""
     verifier:
       digital_credentials:
         # Not a field vc main has - it comes from the Vega ZK branch the

@@ -614,6 +614,12 @@ def _vc_service_files(app: str, out_dir: Path, pki_dir: Path, service: str, meta
     if presentation_requests:
         for f in sorted((out_dir / "pres-reqs").glob("*")):
             args += ["--file-local", f"/pres-reqs/{f.name}={f}"]
+    # The chart decodes these from the branding ConfigMap in an initContainer;
+    # vc_render.write_branding_assets does it at render time instead, and the
+    # mount point is the chart's own /branding-assets so the config the
+    # services read is identical either way.
+    for f in sorted((out_dir / "branding-assets").glob("*.png")):
+        args += ["--file-local", f"/branding-assets/{f.name}={f}"]
     if bootstrapping:
         for f in sorted((out_dir / "documents").glob("*")):
             args += ["--file-local", f"/documents/{f.name}={f}"]
