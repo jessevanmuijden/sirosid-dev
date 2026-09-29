@@ -56,8 +56,12 @@ services:
       - ISSUER_ADDR=http://vc-apigw:9003
       - ISSUER_TLS=false
       - ISSUER_API_KEY_PATH=/run/secrets/issuer-token
-      - ISSUER_SCOPE=siros_id
-      - ISSUER_FORMAT=sdjwt
+      # EWC RFC013 Photo ID as an mdoc: features.credentialTypes.photoid in
+      # values-base.yaml. Its card template shows the passport portrait.
+      - ISSUER_SCOPE=photoid
+      - ISSUER_FORMAT=mdoc
+      - ISSUER_ISSUING_AUTHORITY=SIROS Foundation
+      - ISSUER_ISSUING_COUNTRY=SE
       # Rules are baked into the image at /app/rules by facetec-api's own Dockerfile.
       - POLICY_RULES_DIR=/app/rules
     depends_on:
