@@ -57,11 +57,10 @@ services:
       - ISSUER_TLS=false
       - ISSUER_API_KEY_PATH=/run/secrets/issuer-token
       # EWC RFC013 Photo ID as an mdoc: features.credentialTypes.photoid in
-      # values-base.yaml. Its card template shows the passport portrait.
+      # values-base.yaml. issuing_country comes from the passport itself.
       - ISSUER_SCOPE=photoid
       - ISSUER_FORMAT=mdoc
       - ISSUER_ISSUING_AUTHORITY=SIROS Foundation
-      - ISSUER_ISSUING_COUNTRY=SE
       # Rules are baked into the image at /app/rules by facetec-api's own Dockerfile.
       - POLICY_RULES_DIR=/app/rules
     depends_on:

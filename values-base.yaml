@@ -218,8 +218,9 @@ features:
     # (docker-compose.facetec.yml, ISSUER_FORMAT=mdoc). facetec-api uploads
     # the document and hands the wallet a pre-authorized offer, so the
     # authProvider below only matters for the synthetic documents in
-    # fixtures/vc-bootstrapping/photoid.json. The MDDL's svg_template puts
-    # the portrait on the wallet's credential card.
+    # fixtures/vc-bootstrapping/photoid.json. The MDDL's svg_template shows
+    # name, birth date, nationality and expiry on the wallet's card; the
+    # portrait is shown among the claims on the detail page, not on the card.
     photoid:
       vct: "eu.europa.ec.eudi.photoid.1"
       doctype: "eu.europa.ec.eudi.photoid.1"
