@@ -167,6 +167,9 @@ apigw:
         {{- range $id, $data := . }}
         {{ $id | quote }}:
           auth_provider: {{ $data.issuance.authProvider | quote }}
+          {{- if and $.Values.issuer.datastoreAuthenticSource (ne $data.issuance.authProvider "preauth") }}
+          authentic_source: {{ $.Values.issuer.datastoreAuthenticSource | quote }}
+          {{- end }}
           {{- if eq $data.issuance.authProvider "oidc" }}
           auth_claims: {{- $data.issuance.authOptions.claims | toYamlPretty | nindent 12 }}
           {{- else if eq $data.issuance.authProvider "openid4vp" }}

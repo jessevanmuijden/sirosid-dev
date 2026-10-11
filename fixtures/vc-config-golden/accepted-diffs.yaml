@@ -28,6 +28,29 @@ _shared: &shared
   - path: apigw.data_sources.datastore.scopes.iban_ov
     kind: added
     reason: "IBAN-OV (eu.we-build.iban-ov.1) credential type, datastore-sourced behind PID authentication (openid4vp)"
+  # --- identity-mapping namespace (2026-10-11) -----------------------------------
+  # vc builds with SUNET/vc#507 + #735 refuse an OIDC/openid4vp login whose identity-mapping namespace is empty
+  # (IDENTITY_MAPPING_NAMESPACE_REQUIRED); the per-scope `authentic_source` (values-base.yaml
+  # issuer.datastoreAuthenticSource: mini-oidc, the namespace of fixtures/vc-bootstrapping/identity_mappings.json)
+  # supplies it. Older vc images ignore the key. The goldens predate it.
+  - path: apigw.data_sources.datastore.scopes.diploma.authentic_source
+    kind: added
+    reason: "identity-mapping namespace for the datastore lookup after an OIDC login (SUNET/vc#507/#735)"
+  - path: apigw.data_sources.datastore.scopes.mdl.authentic_source
+    kind: added
+    reason: "identity-mapping namespace for the datastore lookup after an OIDC login (SUNET/vc#507/#735)"
+  - path: apigw.data_sources.datastore.scopes.mdl_zk4.authentic_source
+    kind: added
+    reason: "identity-mapping namespace for the datastore lookup after an OIDC login (SUNET/vc#507/#735)"
+  - path: apigw.data_sources.datastore.scopes.pid_1_8.authentic_source
+    kind: added
+    reason: "identity-mapping namespace for the datastore lookup after an OIDC login (SUNET/vc#507/#735)"
+  - path: apigw.data_sources.datastore.scopes.pid_mdoc.authentic_source
+    kind: added
+    reason: "identity-mapping namespace for the datastore lookup after an OIDC login (SUNET/vc#507/#735)"
+  - path: apigw.data_sources.datastore.scopes.photoid
+    kind: added
+    reason: "Photo ID mdoc credential type (sirosfoundation/sirosid-dev#42), OIDC-authenticated datastore scope with the identity-mapping namespace; the goldens predate it"
   # --- mount points moved to the chart's names -------------------------------
   # The chart mounts VCTM/MDDL documents at /vctms, bootstrapping documents at
   # /documents and presentation-request templates at /pres-reqs, where the old

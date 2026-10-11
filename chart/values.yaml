@@ -143,6 +143,12 @@ issuer:
   identitymappingImport:
     identities: {}
     users: []
+  # The identity-mapping namespace (authentic_source) the apigw resolves an authenticated user in, for every
+  # datastore scope that is not preauth. vc builds that contain SUNET/vc#507 + #735 REQUIRE it (an OIDC/SAML/
+  # openid4vp login with no namespace is refused with IDENTITY_MAPPING_NAMESPACE_REQUIRED) and must match the
+  # namespace the mappings were imported under (fixtures/vc-bootstrapping/identity_mappings.json: mini-oidc).
+  # EMPTY = the key is not rendered, which is what older vc images need: they do not know it.
+  datastoreAuthenticSource: ""
   datastoreImport:
     documents: {}
     users: []
