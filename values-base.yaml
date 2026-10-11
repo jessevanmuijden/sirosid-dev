@@ -262,6 +262,12 @@ issuer:
   identitymappingImport:
     identities:
       identity_mappings: {file: fixtures/vc-bootstrapping/identity_mappings.json}
+  # The identity-mapping namespace the apigw resolves an authenticated user in. vc builds containing SUNET/vc#507 + #735
+  # refuse an OIDC/SAML/openid4vp login with no namespace (IDENTITY_MAPPING_NAMESPACE_REQUIRED) - every issuance in an
+  # environment running upstream main failed with it. It must match the namespace the fixture mappings are imported
+  # under (fixtures/vc-bootstrapping/identity_mappings.json: mini-oidc). Older vc images read config with a plain
+  # yaml.Unmarshal and ignore the key, so this is safe as the default for every environment.
+  datastoreAuthenticSource: mini-oidc
   # One file per datastore-sourced scope, keyed by holder. Each scope has at
   # least one document covering only that type's mandatory claims and exactly
   # one whose `meta.document_id` ends in `-full`, covering mandatory AND every

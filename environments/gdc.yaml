@@ -28,7 +28,9 @@ credential_registries:
   - https://registry.siros.org
 
 images:
-  # vc: BUILT LOCALLY from SUNET/vc upstream main - commit dc4c08e4f (2026-10-07, merge of #751).
+  # vc: BUILT LOCALLY from SUNET/vc upstream main - commit 0e637904 (2026-10-09, #766). It must be newer than dc4c08e4f: that one had #507/#751 (an OIDC login with an empty
+  # identity-mapping namespace is refused, IDENTITY_MAPPING_NAMESPACE_REQUIRED) without #735 (the per-scope authentic_source
+  # key; values-base.yaml issuer.datastoreAuthenticSource supplies it), so every issuance failed on it.
   # Every fix this environment once needed is merged upstream now (#667 VCTM raw bytes, #668 metadata
   # signing limit, #669 type metadata for registry-resolved scopes, #722 Vega ZK 32-byte salt), so this is
   # plain main with no patches. Build recipe, per service (registry issuer verifier apigw):
@@ -42,10 +44,10 @@ images:
   #
   # All four vc-services MUST be bumped together: they share one config shape unmarshaled into the same
   # model.Cfg, so leaving one on an older binary while another expects a newer shape crash-loops it.
-  vc-verifier: registry.fly.io/sirosid-gdc-vc-verifier:local-1791454606
-  vc-apigw: registry.fly.io/sirosid-gdc-vc-apigw:local-1791453929
-  vc-issuer: registry.fly.io/sirosid-gdc-vc-issuer:local-1791453929
-  vc-registry: registry.fly.io/sirosid-gdc-vc-registry:local-1791453929
+  vc-verifier: registry.fly.io/sirosid-gdc-vc-verifier:local-1791747806
+  vc-apigw: registry.fly.io/sirosid-gdc-vc-apigw:local-1791747806
+  vc-issuer: registry.fly.io/sirosid-gdc-vc-issuer:local-1791747806
+  vc-registry: registry.fly.io/sirosid-gdc-vc-registry:local-1791747806
 
   # Pinned here rather than in values-fly.yaml because that file is shared by
   # every Fly environment and this is gdc's pin, not a vetted default for all
