@@ -177,6 +177,16 @@ apigw:
             {{- range $scopeid, $scope := $data.issuance.authOptions.scopes }}
             {{ $scopeid | quote }}:
               auth_claims: {{- $scope.claims | toYamlPretty | nindent 16 }}
+              {{- /* Both only take effect in a vc build with the auth-scope
+                     claim copy (see values-base.yaml nym_auth); vc main reads
+                     config with a non-strict yaml.Unmarshal and ignores them,
+                     so they are safe to render for every image. */}}
+              {{- with $scope.identityAttributes }}
+              identity_attributes: {{- toYamlPretty . | nindent 16 }}
+              {{- end }}
+              {{- with $scope.documentClaims }}
+              document_claims: {{- toYamlPretty . | nindent 16 }}
+              {{- end }}
             {{- end }}
           {{- end }}
         {{- end -}}
