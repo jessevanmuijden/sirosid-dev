@@ -142,6 +142,19 @@ class CoverageTests(unittest.TestCase):
                 doc = json.loads(block)
                 self.assertEqual(validate(doc, CAPABILITIES), [], f"{t.id}: {block}")
 
+    def test_every_credential_type_is_documented(self):
+        # The formats table in concepts names every declared type, and the
+        # issuing table every type issued from datastore documents (with who
+        # holds them) - a new type nobody can find is a type nobody tests.
+        values = yaml.safe_load((ROOT / "values-base.yaml").read_text(encoding="utf-8"))
+        concepts = body_of("concepts")
+        for scope in values["features"]["credentialTypes"]:
+            self.assertIn(f"`{scope}`", concepts, f"concepts does not name credential type {scope}")
+        issuing = body_of("issuing")
+        for scope in values["issuer"]["datastoreImport"]["documents"]:
+            self.assertRegex(issuing, rf"(?m)^\| `{re.escape(scope)}` \|",
+                             f"issuing's documents table has no row for {scope}")
+
     def test_every_mcp_tool_is_documented(self):
         # Read from the source, so this runs without the service's requirements installed.
         src = (ROOT / "sirosid_service" / "mcp.py").read_text(encoding="utf-8")

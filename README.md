@@ -405,6 +405,7 @@ picks between them.
 | `eucc` | erik-010, maria-011, jan-012 | sophie-013 |
 | `eu_poa` | jan-012 | sophie-013 |
 | `iban_ov` | erik-010, maria-011, jan-012 | sophie-013 |
+| `nym_auth` | alice-001, bob-002 | carol-003 |
 
 Derived claims (`age_in_years`, `age_birth_year`, `age_over_18/21/65`,
 `age_equal_or_over.*`) are recomputed from the birth date **at test time**, so
@@ -460,6 +461,52 @@ without one cannot start the flow at all.
 
 The verifier has matching presentation-request templates in
 `fixtures/vc-presentation-requests/eu_business_wallet.yaml`.
+
+### nym_auth (Nym-authentication attestation)
+
+`nym_auth` is the natural-person attestation of the
+[Nym-authentication rulebook](https://github.com/sirosfoundation/nym_auth_rulebook)
+(v0.3): an `mso_mdoc` whose doctype and namespace are both
+`eu.europa.ec.eudi.nym_auth.1`, carrying `birth_date` (full-date, tag 1004),
+`ssc` - SHA-256 of a 16-byte `secret_seed` the issuer and the prover share -
+and optionally `psc` (SHA-256 of a prover-only seed). It exists for
+`circuit_zk` presentations: pseudonyms and age predicates proven in zero
+knowledge, never disclosed. `fixtures/vc-metadata/nym_auth.mdoc.json` is a
+byte-for-byte copy of the rulebook's schema until registry.siros.org
+publishes it (mdoc types stay vendored even with `REGISTRY=external`).
+
+**Who can get it:** alice-001, bob-002 and carol-003
+(`fixtures/vc-bootstrapping/nym_auth.json`; carol-003's is the `-full`
+document, with `psc`). **How:** request `nym_auth` in the wallet; the issuer
+asks, during OpenID4VCI, for any one of a PID (`pid_1_8` or `pid_1_5`, SD-JWT),
+a `pid_mdoc`, an `mdl` or a `photoid`, and the person in it selects the
+document through `identity_mappings.json`. Get one of those first.
+
+**Birth date.** The issued `birth_date` is meant to be **copied from the
+presented credential** (normalised to `YYYY-MM-DD`: an SD-JWT PID's
+`birthdate`, an mdoc's tag-1004 `birth_date`). vc main cannot copy a presented
+claim into a datastore-sourced credential, so values-base.yaml also renders
+`auth_scopes.<x>.document_claims` (and `identity_attributes`, which lets the
+`pid_mdoc`/`photoid` options resolve a person) for a proposed vc change; vc
+main ignores both keys and issues the document's own `birth_date`, which
+`tests/test_fixture_integrity.py` holds equal to the birth date in every
+credential the person can present. With vc main only the `pid_1_8`, `pid_1_5`
+and `mdl` options resolve a person; `pid_mdoc` stays unusable even with the vc
+change until our `pid_mdoc` schema carries a `birth_date`.
+
+**`ssc`/`psc` are TEMPORARY test commitments until SUNET/vc supports them**
+(per-holder seed, commitment, seed delivery). Every document carries the
+same values, from public test seeds - so every holder derives the same
+pseudonyms: good for testing a circuit, useless for testing unlinkability or
+known-offender matching. `fixtures/vc-bootstrapping/nym_auth.json` is the one
+place to change when vc can do better.
+
+| claim | test seed (hex, 16 bytes) | commitment (standard base64 of SHA-256(seed), as the datastore stores a bstr) |
+|---|---|---|
+| `ssc` | `000102030405060708090a0b0c0d0e0f` | `vkXLJgW/Nr695oSEGijw/UPGmFCj3OX+26aZKO46iZE=` |
+| `psc` (carol-003 only) | `101112131415161718191a1b1c1d1e1f` | `/C4scwcr+ivaA/+TB0ct69PMgQUCioqeI141uo0uN/Q=` |
+
+Recompute: `python3 -c "import hashlib,base64,sys;print(base64.b64encode(hashlib.sha256(bytes.fromhex(sys.argv[1])).digest()).decode())" 000102030405060708090a0b0c0d0e0f`
 
 ### Service Architecture
 
