@@ -231,6 +231,79 @@ features:
         source: datastore
         authOptions:
           claims: [given_name, family_name]
+    # Nym-authentication attestation (sirosfoundation/nym_auth_rulebook v0.3):
+    # birth_date + ssc (SHA-256 of a 16-byte secret seed shared by issuer and
+    # prover) + optional psc, for circuit_zk pseudonym and age-predicate
+    # presentations. doctype and namespace are both eu.europa.ec.eudi.nym_auth.1.
+    #
+    # fixtures/vc-metadata/nym_auth.mdoc.json is a byte-for-byte COPY of the
+    # rulebook's nym_auth.mdoc.json until registry.siros.org publishes it. Once
+    # it is published: diff the published document against this copy, replace
+    # the copy with it (mdoc types stay vendored even with REGISTRY=external -
+    # see sirosid_core/vc_render.py), and drop this paragraph.
+    #
+    # Issuance: the wallet presents ANY ONE of the credentials under `scopes`
+    # (OpenID4VP during OpenID4VCI; vc ORs auth_scopes into one DCQL
+    # credential_set), the identity in it selects the holder's document in
+    # fixtures/vc-bootstrapping/nym_auth.json, and the issued birth_date is
+    # COPIED from the presented credential (`documentClaims`, normalised to a
+    # full-date, which the mdoc issuer encodes as tag 1004).
+    #
+    # vc main does not copy yet: `documentClaims` and `identityAttributes` are
+    # a proposed vc change (auth_scopes.<x>.document_claims /
+    # identity_attributes - README.md, "nym_auth"); vc main ignores both keys,
+    # issues the document's own birth_date, which tests/test_fixture_integrity.py
+    # holds equal to the birth date in every credential the person can present,
+    # and can resolve only the pid_1_8, pid_1_5 and mdl options (its
+    # ResolveIdentifier reads only the unqualified given_name/family_name/
+    # birth_date, so pid_mdoc and photoid fail "no identifier claim or identity
+    # attributes found in claims"). Our pid_mdoc schema has no birth_date, so
+    # with the vc change that option is refused (fail closed) until it has one.
+    #
+    # Claim names follow vc (handlers_verifier.go authClaimPathSegments): an
+    # SD-JWT claim by name; an mdoc bare name is a claim of org.iso.18013.5.1,
+    # any other namespace is spelled "<namespace>.<element>". No mdoc
+    # birth_date in `claims`: it arrives as CBOR tag 1004, not a string, and
+    # vc main refuses an identity claim that is not a string.
+    #
+    # ssc/psc: TEMPORARY test commitments until SUNET/vc supports ssc/psc
+    # (per-holder seed, commitment, seed delivery). Every document in
+    # fixtures/vc-bootstrapping/nym_auth.json carries the SAME ssc (and the
+    # -full one the same psc), the SHA-256 of a public test seed listed in
+    # README.md - that file is the one place to replace when vc can do it.
+    nym_auth:
+      vct: "eu.europa.ec.eudi.nym_auth.1"
+      doctype: "eu.europa.ec.eudi.nym_auth.1"
+      format: mso_mdoc
+      mdocSchema: {file: fixtures/vc-metadata/nym_auth.mdoc.json}
+      issuance:
+        authProvider: openid4vp
+        source: datastore
+        authOptions:
+          scopes:
+            pid_1_8:
+              claims: [given_name, family_name, birthdate]
+              identityAttributes: {birthdate: birth_date}
+              documentClaims: {birthdate: birth_date}
+            pid_1_5:
+              claims: [given_name, family_name, birthdate]
+              identityAttributes: {birthdate: birth_date}
+              documentClaims: {birthdate: birth_date}
+            pid_mdoc:
+              claims: [eu.europa.ec.eudi.pid.1.given_name, eu.europa.ec.eudi.pid.1.family_name]
+              identityAttributes:
+                eu.europa.ec.eudi.pid.1.given_name: given_name
+                eu.europa.ec.eudi.pid.1.family_name: family_name
+              documentClaims: {eu.europa.ec.eudi.pid.1.birth_date: birth_date}
+            mdl:
+              claims: [given_name, family_name]
+              documentClaims: {birth_date: birth_date}
+            photoid:
+              claims: [org.iso.23220.1.given_name_unicode, org.iso.23220.1.family_name_unicode]
+              identityAttributes:
+                org.iso.23220.1.given_name_unicode: given_name
+                org.iso.23220.1.family_name_unicode: family_name
+              documentClaims: {org.iso.23220.1.birth_date: birth_date}
 
 issuer:
   # Bearer-JWT auth for apigw's admin/datastore API (/api/v1/*). The chart
@@ -290,6 +363,9 @@ issuer:
       eucc: {file: fixtures/vc-bootstrapping/eucc.json}
       eu_poa: {file: fixtures/vc-bootstrapping/eu_poa.json}
       iban_ov: {file: fixtures/vc-bootstrapping/iban_ov.json}
+      # One per natural person; PID/mDL/Photo ID-authenticated (see
+      # features.credentialTypes.nym_auth). README.md lists the test seeds.
+      nym_auth: {file: fixtures/vc-bootstrapping/nym_auth.json}
 
   apigw:
     cors:
@@ -344,16 +420,20 @@ issuer:
               # native app's deep link, and the web wallet's real callback
               # route under BASE_PATH=/id/default/. Dropping either one 401s
               # that platform's flow with vc-apigw's invalid_client.
+              # nym_auth is requested through these clients like any type;
+              # photoid is here because it is one of the credentials nym_auth
+              # accepts as authentication, so a tester has to be able to get
+              # one from this issuer too.
               e2e-test-client:
                 type: public
                 redirect_uri:
                   - "siros-sample://callback"
                   - "http://localhost:3000/id/default/cb"
-                scopes: [pid, pid_1_5, pid_1_8, diploma, ehic, mdl, mdl_zk4, pid_mdoc, ebw_oid, eucc, eu_poa, iban_ov]
+                scopes: [pid, pid_1_5, pid_1_8, diploma, ehic, mdl, mdl_zk4, pid_mdoc, photoid, ebw_oid, eucc, eu_poa, iban_ov, nym_auth]
               e2e-test-client-2:
                 type: public
                 redirect_uri: "http://localhost:3000/id/default/cb"
-                scopes: [pid, pid_1_5, pid_1_8, diploma, ehic, mdl, pid_mdoc, ebw_oid, eucc, eu_poa, iban_ov]
+                scopes: [pid, pid_1_5, pid_1_8, diploma, ehic, mdl, pid_mdoc, photoid, ebw_oid, eucc, eu_poa, iban_ov, nym_auth]
         data_sources:
           assertion:
             scopes:
