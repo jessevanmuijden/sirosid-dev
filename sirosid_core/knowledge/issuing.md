@@ -1,7 +1,7 @@
 ---
 title: "Issuing credentials in an environment"
 summary: "How a wallet gets a credential from an instance's issuer - the mini-oidc login, the synthetic users and their documents per scope, PID-authenticated types, and why \"no documents\" happens."
-digest: "Issue from the web wallet (wallet-frontend URL, /id/default/): passkey sign-up, add a credential, pick a mini-oidc user (no password). Datastore types need a user who owns a document for that scope; EU Business Wallet types need a PID first. \"no documents\" = wrong user or stale datastore."
+digest: "Issue from the web wallet (wallet-frontend URL, /id/default/): passkey sign-up, add a credential, pick a mini-oidc user (no password). Datastore types need a user who owns a document for that scope; EU Business Wallet types need a PID first, nym_auth a PID, mDL or Photo ID. \"no documents\" = wrong user or stale datastore."
 order: 70
 tags: [issuing, openid4vci, mini-oidc, users, fixtures, pid, datastore, no-documents]
 ---
@@ -50,10 +50,11 @@ mandatory ones):
 | `eucc` | dc+sd-jwt | erik-010, maria-011, jan-012 | sophie-013 |
 | `eu_poa` | dc+sd-jwt | jan-012 | sophie-013 |
 | `iban_ov` | dc+sd-jwt | erik-010, maria-011, jan-012 | sophie-013 |
+| `nym_auth` | mso_mdoc | alice-001, bob-002 | carol-003 |
 
 `mdl_zk4` is the 4-claim mDL for Vega ZK tests; its `-full` document (bob-002) fills all four circuit
-slots. `siros_id` and `photoid` are defined, but are not in the scope list of the OAuth client the wallet
-uses, so requesting them through the web wallet may be refused (unverified).
+slots. `siros_id` is defined, but is not in the scope list of the OAuth client the wallet uses, so
+requesting it through the web wallet may be refused (unverified).
 
 ## PID-authenticated types (EU Business Wallet)
 
@@ -65,6 +66,20 @@ given name, family name and birth date against the identity mappings. So:
 2. then request the attestation; present that PID when asked.
 
 alice, bob and carol have no business documents, so their PID leads to "no documents".
+
+## nym_auth (Nym-authentication attestation)
+
+`nym_auth` (doctype `eu.europa.ec.eudi.nym_auth.1`, nym_auth rulebook v0.3) holds a birth date and seed
+commitments (`ssc`, optional `psc`) for zero-knowledge pseudonym and age proofs. It is also
+presentation-authenticated, but for the natural persons (alice-001, bob-002, carol-003), and the issuer
+accepts any ONE of `pid_1_8`, `pid_1_5`, `pid_mdoc`, `mdl` or `photoid`. So: get one of those as that
+user first, then request `nym_auth` and present it when asked.
+- The issued birth date is meant to be copied from the presented credential. Current vc cannot copy it;
+  it issues the stored one, which is the same person's birth date.
+- With current vc only the `pid_1_8`, `pid_1_5` and `mdl` options can identify the person; `pid_mdoc` and
+  `photoid` fail to resolve an identity (a known vc gap).
+- `ssc`/`psc` are temporary fixed test values, the same for every holder, so every holder derives the same
+  pseudonyms. The schema is a copy of the rulebook's until registry.siros.org publishes it.
 
 ## "no documents"
 
@@ -94,4 +109,4 @@ The issuer found no document for the identity. Check in this order:
   the environment's admin-API key held by whoever deployed it, so it is not available for hosted
   instances, and it is reported not to work against current vc main (unverified here). Do not offer it.
 
-Sources: `README.md`, `CLAUDE.md`, `values-base.yaml`, `fixtures/vc-bootstrapping/identity_mappings.json`, `fixtures/vc-bootstrapping/pid_1_8.json`, `sirosid_core/render.py`, `sirosid_core/deploy.py`, `scripts/bootstrap.py`, `scripts/datastore.py`, `../mini-oidc/README.md`
+Sources: `README.md`, `CLAUDE.md`, `values-base.yaml`, `fixtures/vc-bootstrapping/identity_mappings.json`, `fixtures/vc-bootstrapping/pid_1_8.json`, `fixtures/vc-bootstrapping/nym_auth.json`, `fixtures/vc-metadata/nym_auth.mdoc.json`, `sirosid_core/render.py`, `sirosid_core/deploy.py`, `scripts/bootstrap.py`, `scripts/datastore.py`, `../mini-oidc/README.md`

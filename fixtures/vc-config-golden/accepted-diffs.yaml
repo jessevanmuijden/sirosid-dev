@@ -28,6 +28,16 @@ _shared: &shared
   - path: apigw.data_sources.datastore.scopes.iban_ov
     kind: added
     reason: "IBAN-OV (eu.we-build.iban-ov.1) credential type, datastore-sourced behind PID authentication (openid4vp)"
+  # --- nym_auth (2026-10-13) ------------------------------------------------------
+  # Nym-authentication attestation (values-base.yaml nym_auth, nym_auth_rulebook v0.3). Its other footprints -
+  # credential_metadata, the derived OpenID4VCI/OpenID4VP client scopes and the verifier's supported_credentials -
+  # fall under the whole-path entries below; the datastore scope is the only one the goldens name scope by scope.
+  - path: apigw.data_sources.datastore.scopes.nym_auth
+    kind: added
+    reason: >-
+      nym_auth (eu.europa.ec.eudi.nym_auth.1, mso_mdoc) credential type, datastore-sourced behind openid4vp
+      authentication with five OR'd auth scopes - pid_1_8, pid_1_5 (SD-JWT) and pid_mdoc, mdl, photoid (mdoc) -
+      and the mini-oidc identity-mapping namespace
   # --- identity-mapping namespace (2026-10-11) -----------------------------------
   # vc builds with SUNET/vc#507 + #735 refuse an OIDC/openid4vp login whose identity-mapping namespace is empty
   # (IDENTITY_MAPPING_NAMESPACE_REQUIRED); the per-scope `authentic_source` (values-base.yaml

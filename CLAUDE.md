@@ -521,6 +521,27 @@ the wrong thing.
   `-full` document per scope; two documents of one scope for one holder make
   issuance ambiguous. README.md has the per-scope table.
 
+What vc main actually matches on, read from its code (2026-10-13):
+`ResolveIdentifier` (internal/apigw/apiv1/handlers_issuer.go) takes only the
+*unqualified* keys `given_name`/`family_name`/`birth_date` out of the
+extracted auth claims. An SD-JWT PID's `birthdate` must be disclosed but is
+never compared; an mdoc claim outside `org.iso.18013.5.1` (written
+`<namespace>.<element>` in `authOptions.scopes`, or the DCQL path is wrong)
+matches nothing, so `pid_mdoc`/`photoid` cannot authenticate yet; and an mdoc
+date is never usable as an auth claim - it decodes to a CBOR tag 1004, and a
+non-string identity claim fails the whole presentation.
+
+`nym_auth` (values-base.yaml has the long comment) is the first type
+authenticated by mdocs as well as PIDs, and its birth date is meant to be
+copied from the presented credential. vc main cannot copy a presented claim
+into a datastore document, so the chart renders
+`auth_scopes.<x>.document_claims`/`identity_attributes` for a proposed vc
+change and vc main ignores them; until then the document's own `birth_date`
+is issued, and `tests/test_fixture_integrity.py` (`NymAuth`) holds it equal to
+the birth date in every credential that person can present. Its `ssc`/`psc`
+are TEMPORARY fixed test commitments (README.md lists the seeds) until vc
+supports per-holder seeds.
+
 Derived age claims are recomputed from the birth date at test time, so they
 fail the suite rather than rot. Adding or changing a document needs a
 storage clear or a `make datastore-upload` on an existing environment — see
