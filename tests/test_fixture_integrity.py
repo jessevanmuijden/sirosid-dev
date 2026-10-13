@@ -88,6 +88,7 @@ IDENTITY_CLAIMS = {
     "iban_ov": {("account_ownership", "given_name"): "given_name",
                 ("account_ownership", "surname"): "family_name"},
     "eu_poa": {("attorney_date_of_birth",): "birth_date"},
+    "nym_auth": {("birth_date",): "birth_date"},
 }
 
 # Derived age claims, per scope: the birth-date claim, then each derived claim
@@ -486,6 +487,219 @@ class IdentityMatchesMappings(FixtureCase):
                              f"pid_1_8.json[{holder}] birth_given_name drifted")
             self.assertEqual(data["birth_family_name"], data["family_name"],
                              f"pid_1_8.json[{holder}] birth_family_name drifted")
+
+
+class NymAuth(FixtureCase):
+    """nym_auth (nym_auth_rulebook v0.3) - issued behind a presented PID, mDL or
+    Photo ID, with the birth date of the presented credential.
+
+    vc main cannot copy a presented claim into a datastore document, so the
+    document's own birth_date is what vc main issues; these tests hold it equal
+    to the birth date every presentable credential of the same person carries
+    - the value a vc with auth_scopes.<x>.document_claims copies instead - so
+    both builds issue the same date.
+    """
+
+    SCOPE = "nym_auth"
+    NAMESPACE = "eu.europa.ec.eudi.nym_auth.1"
+    AUTH_SCOPES = {"pid_1_8", "pid_1_5", "pid_mdoc", "mdl", "photoid"}
+    NATURAL_PERSONS = {"alice-001", "bob-002", "carol-003"}
+    PRIMARY_MDOC_NAMESPACE = "org.iso.18013.5.1"
+
+    # TEMPORARY test commitments until SUNET/vc supports ssc/psc (per-holder
+    # seed, commitment computation, seed delivery). Public by design; README.md
+    # ("nym_auth") documents them, and test_readme_documents_the_test_seeds
+    # keeps the two in step.
+    SSC_TEST_SEED = bytes(range(0, 16))    # 000102030405060708090a0b0c0d0e0f
+    PSC_TEST_SEED = bytes(range(16, 32))   # 101112131415161718191a1b1c1d1e1f
+
+    # Source credentials whose own schema cannot supply the birth date yet.
+    # vc with document_claims refuses such a presentation (fail closed) rather
+    # than issue the stored date - so the option is unusable until the gap is
+    # closed, and this test fails the day it is, to have the entry removed.
+    BIRTH_DATE_GAPS = {
+        "pid_mdoc": "fixtures/vc-metadata/pid_mdoc.mdoc.json is a 4-claim stub without the EU PID's birth_date",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.spec = cls.types[cls.SCOPE]
+        cls.auth = cls.spec["issuance"]["authOptions"]["scopes"]
+        cls.schema = load_json(ROOT / cls.spec["mdocSchema"]["file"])
+        cls.docs = cls.documents[cls.SCOPE]
+
+    # -- the type -----------------------------------------------------------
+    def test_type_is_the_rulebooks_mdoc(self):
+        self.assertEqual(self.spec["format"], "mso_mdoc")
+        self.assertEqual(self.spec["doctype"], self.NAMESPACE)
+        self.assertEqual(self.schema["doctype"], self.NAMESPACE)
+        self.assertEqual(self.schema["format"], "mso_mdoc")
+        # Document type and namespace MUST both be eu.europa.ec.eudi.nym_auth.1.
+        self.assertEqual(list(self.schema["claims"]), [self.NAMESPACE])
+        claims = self.schema["claims"][self.NAMESPACE]
+        self.assertEqual({k: (v.get("value_type"), bool(v.get("mandatory"))) for k, v in claims.items()},
+                         {"birth_date": ("full-date", True), "ssc": ("bstr", True), "psc": ("bstr", False)})
+
+    def test_issued_behind_openid4vp_from_the_datastore(self):
+        issuance = self.spec["issuance"]
+        self.assertEqual((issuance["authProvider"], issuance["source"]), ("openid4vp", "datastore"))
+        self.assertEqual(set(self.auth), self.AUTH_SCOPES)
+        for scope in self.auth:
+            self.assertIn(scope, self.types, f"auth scope {scope} is no declared credential type")
+
+    # -- the documents ------------------------------------------------------
+    def test_one_document_per_natural_person(self):
+        self.assertEqual(set(self.docs), self.NATURAL_PERSONS)
+        for holder, doc in self.docs.items():
+            self.assertEqual(doc["identity_mapping_ids"], [holder])
+            self.assertEqual(doc["meta"]["scope"], self.SCOPE)
+
+    def test_minimal_documents_carry_exactly_the_mandatory_claims(self):
+        for holder, doc in self.docs.items():
+            want = {"birth_date", "ssc", "psc"} if doc["meta"]["document_id"].endswith("-full") \
+                else {"birth_date", "ssc"}
+            self.assertEqual(set(doc["document_data"]), want, holder)
+
+    def test_ssc_and_psc_are_the_documented_temporary_test_commitments(self):
+        # vc's mdoc issuer reads a bstr from the datastore as STANDARD base64
+        # (pkg/mdoc/issuer.go convertElementValue), as mdl_zk4's pseudonym_seed.
+        import base64
+        import hashlib
+        expected = {"ssc": hashlib.sha256(self.SSC_TEST_SEED).digest(),
+                    "psc": hashlib.sha256(self.PSC_TEST_SEED).digest()}
+        for holder, doc in self.docs.items():
+            for claim in ("ssc", "psc"):
+                if claim not in doc["document_data"]:
+                    continue
+                raw = base64.b64decode(doc["document_data"][claim], validate=True)
+                self.assertEqual(len(raw), 32, f"{holder}.{claim}: the rulebook wants bstr .size 32")
+                self.assertEqual(raw, expected[claim],
+                                 f"{holder}.{claim} is not SHA-256 of the documented {claim} test seed")
+
+    def test_readme_documents_the_test_seeds(self):
+        import base64
+        import hashlib
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for seed in (self.SSC_TEST_SEED, self.PSC_TEST_SEED):
+            self.assertIn(seed.hex(), readme)
+            self.assertIn(base64.b64encode(hashlib.sha256(seed).digest()).decode(), readme)
+        self.assertIn("TEMPORARY", readme)
+
+    # -- the birth date -----------------------------------------------------
+    def source_birth_date(self, auth_scope, holder):
+        """The birth date `holder`'s `auth_scope` credential carries at the
+        claim nym_auth's documentClaims copies from, as a date - or None when
+        the holder has no such credential."""
+        (source, target), = self.auth[auth_scope]["documentClaims"].items()
+        self.assertEqual(target, "birth_date")
+        spec = self.types[auth_scope]
+        if spec["issuance"]["source"] == "assertion":
+            # pid_1_5 is built from mini-oidc's own claims at issuance; its
+            # `birthdate` is mini-oidc's, which identity_mappings.json mirrors.
+            self.assertEqual(source, "birthdate")
+            value = self.mappings[holder][0]["attributes"]["birth_date"]
+        else:
+            if spec["format"] == "mso_mdoc":
+                path = (mdoc_element(source, load_json(ROOT / spec["mdocSchema"]["file"]))[1],)
+            else:
+                path = tuple(source.split("."))
+            doc = self.documents.get(auth_scope, {}).get(holder)
+            if doc is None:
+                return None
+            value = dig(doc["document_data"], path)
+        return normalise_full_date(value)
+
+    def test_documents_birth_date_is_the_presented_credentials(self):
+        for holder, doc in self.docs.items():
+            issued = doc["document_data"]["birth_date"]
+            # The canonical RFC 3339 full-date the mdoc issuer tags 1004.
+            self.assertEqual(normalise_full_date(issued).isoformat(), issued, holder)
+            self.assertEqual(issued, self.mappings[holder][0]["attributes"]["birth_date"],
+                             f"nym_auth.json[{holder}] is not {holder}'s mini-oidc birth date")
+            seen = 0
+            for auth_scope in sorted(self.AUTH_SCOPES - set(self.BIRTH_DATE_GAPS)):
+                presented = self.source_birth_date(auth_scope, holder)
+                if presented is None:
+                    continue
+                seen += 1
+                self.assertEqual(presented.isoformat(), issued,
+                                 f"{holder} presenting {auth_scope} would be issued {presented}, "
+                                 f"but nym_auth.json says {issued}")
+            self.assertGreaterEqual(seen, 3, f"{holder} can present too few birth-date sources")
+
+    def test_mini_oidc_users_agree_when_the_checkout_is_there(self):
+        users = ROOT.parent / "mini-oidc" / "users.yaml"
+        if not users.exists():
+            self.skipTest("no ../mini-oidc checkout")
+        by_sub = {u["sub"]: u for u in yaml.safe_load(users.read_text(encoding="utf-8"))["users"]}
+        for holder, doc in self.docs.items():
+            self.assertEqual(str(by_sub[holder]["birthdate"]), doc["document_data"]["birth_date"], holder)
+
+    # -- what vc is asked for -----------------------------------------------
+    def test_every_copied_claim_is_declared_by_its_source_credential(self):
+        for auth_scope, entry in self.auth.items():
+            for source in entry.get("documentClaims", {}):
+                declared = claim_declared(self.types[auth_scope], source)
+                if auth_scope in self.BIRTH_DATE_GAPS:
+                    self.assertFalse(declared, f"{auth_scope} now declares {source}: drop it from "
+                                               f"BIRTH_DATE_GAPS and the values-base.yaml comment")
+                else:
+                    self.assertTrue(declared, f"{auth_scope} does not declare {source}")
+
+    def test_every_auth_claim_resolves_and_is_a_string(self):
+        # vc main refuses a non-string identity claim, and an mdoc full-date
+        # arrives as a CBOR tag 1004 - so no mdoc date may be an auth claim.
+        for auth_scope, entry in self.auth.items():
+            spec = self.types[auth_scope]
+            for claim in entry["claims"]:
+                self.assertTrue(claim_declared(spec, claim), f"{auth_scope}: {claim} is not declared")
+                if spec["format"] == "mso_mdoc":
+                    ns, element = mdoc_element(claim, load_json(ROOT / spec["mdocSchema"]["file"]))
+                    meta = load_json(ROOT / spec["mdocSchema"]["file"])["claims"][ns][element]
+                    self.assertEqual(meta.get("value_type"), "tstr", f"{auth_scope}: {claim}")
+            for claim, attribute in entry.get("identityAttributes", {}).items():
+                self.assertIn(claim, entry["claims"], auth_scope)
+                self.assertIn(attribute, {"given_name", "family_name", "birth_date"}, auth_scope)
+
+    def test_identity_resolves_to_the_mapping_attributes(self):
+        # What ResolveIdentifier matches on is the auth claim renamed by
+        # identityAttributes: every option has to reach given_name AND
+        # family_name, or it cannot select a person.
+        for auth_scope, entry in self.auth.items():
+            names = {entry.get("identityAttributes", {}).get(c, c) for c in entry["claims"]}
+            self.assertLessEqual({"given_name", "family_name"}, names, auth_scope)
+
+
+def mdoc_element(claim, schema):
+    """(namespace, element) an mdoc auth claim names, the way vc's
+    authClaimPathSegments reads it: "<namespace>.<element>" for a namespace the
+    schema has, a bare element for org.iso.18013.5.1."""
+    for ns in schema.get("claims", {}):
+        if claim.startswith(ns + "."):
+            return ns, claim[len(ns) + 1:]
+    return NymAuth.PRIMARY_MDOC_NAMESPACE, claim
+
+
+def claim_declared(spec, claim):
+    if "mdocSchema" in spec:
+        schema = load_json(ROOT / spec["mdocSchema"]["file"])
+        ns, element = mdoc_element(claim, schema)
+        return element in schema.get("claims", {}).get(ns, {})
+    all_paths, _ = vctm_paths(load_json(ROOT / spec["vctm"]["file"]))
+    return tuple(claim.split(".")) in all_paths
+
+
+def normalise_full_date(value):
+    """A presented birth date as a date: a full-date, or a date-time's date
+    (the shapes vc's normaliseFullDate accepts once CBOR tags are unwrapped)."""
+    if isinstance(value, datetime.date):
+        return value if not isinstance(value, datetime.datetime) else value.date()
+    text = str(value)
+    try:
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).date()
 
 
 if __name__ == "__main__":
