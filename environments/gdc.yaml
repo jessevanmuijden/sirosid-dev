@@ -28,8 +28,10 @@ credential_registries:
   - https://registry.siros.org
 
 images:
-  # vc: BUILT LOCALLY from SUNET/vc upstream main - commit 78740eff2 (2026-10-12, #779), a plain
-  # main build with no local branches on top. It carries #770 (same-device wallet launch), #772 (the
+  # vc: BUILT LOCALLY from SUNET/vc upstream main - commit 4bba38e61 (2026-10-13, #787), a plain
+  # main build with no local branches on top. Since 78740eff2 it adds #777 (types/metadata for Interactive Authorization),
+  # #782 (presets visible without a featured one), #783 (unified browser error page), #787 (wallet URLs on /dashboard) and a
+  # fix that makes a signed dc_api request name its expected origin (taken from configuration). It carries #770 (same-device wallet launch), #772 (the
   # consent credential UX), #774 (invalid_tx_code), #776/#780 (the well-known URL) and #779 (wallet
   # client auth), plus the earlier #744/#745/#763. Previously a879fcb9a, whose apigw carried an
   # unmerged #771. It must be newer than dc4c08e4f: that one had #507/#751 (an OIDC login with an empty
@@ -59,10 +61,10 @@ images:
   # makes the ZK Proofs presets visible on the verifier's landing page -
   # both of them are categorised and neither is featured, so they still sit
   # behind "Show more presets" here.
-  vc-verifier: registry.fly.io/sirosid-gdc-vc-verifier:local-1791814969
-  vc-apigw: registry.fly.io/sirosid-gdc-vc-apigw:local-1791814969
-  vc-issuer: registry.fly.io/sirosid-gdc-vc-issuer:local-1791814969
-  vc-registry: registry.fly.io/sirosid-gdc-vc-registry:local-1791814969
+  vc-verifier: registry.fly.io/sirosid-gdc-vc-verifier:local-1791897498
+  vc-apigw: registry.fly.io/sirosid-gdc-vc-apigw:local-1791897498
+  vc-issuer: registry.fly.io/sirosid-gdc-vc-issuer:local-1791897498
+  vc-registry: registry.fly.io/sirosid-gdc-vc-registry:local-1791897498
 
   # Pinned here rather than in values-fly.yaml because that file is shared by
   # every Fly environment and this is gdc's pin, not a vetted default for all
