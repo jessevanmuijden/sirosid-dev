@@ -413,9 +413,10 @@ decides. That path needs the engine to forward the field first; see
 
 DIIP mandates the IETF Token Status List for revocation, and `vc-registry` publishes real ones
 under `make up VC=yes` — no fixture needed. It implements the draft directly, signing tokens
-with the `registry.token_status_lists.key_config` keys in `fixtures/vc-config.yaml`, and
-`vc-apigw` allocates each issued credential a section/index so its `status.status_list.uri`
-already points at a live list:
+with the `registry.token_status_lists.key_config` keys rendered into
+`fixtures/rendered/vc-registry.yaml` (from `values-base.yaml`), and `vc-apigw` allocates each
+issued credential a section/index so its `status.status_list.uri` already points at a live
+list:
 
 ```bash
 # Aggregation of all Status List Token URIs (draft §9.3)
@@ -427,8 +428,9 @@ curl http://localhost:9004/statuslists/0
 
 Both `application/statuslist+jwt` and `application/statuslist+cwt` are supported. To flip a
 credential to revoked or suspended, use the registry's admin GUI at
-<http://localhost:9004/admin/login> (`admin` / `e2e-admin-password`, from
-`fixtures/vc-config.yaml`).
+<http://localhost:9004/admin/login> (`admin`, with the password from
+`fixtures/rendered-secrets/vcAdminGuiPassword` — generated per checkout, no longer a fixed
+literal).
 
 One caveat when testing revocation end-to-end in a browser: the tokens' `iss`/`sub` — and the
 `status.status_list.uri` written into issued credentials — come from `registry.public_url`,

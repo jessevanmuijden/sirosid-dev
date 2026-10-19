@@ -172,7 +172,8 @@ Then:
    wallet resolves the key but trust evaluation still denies, until `go-trust` grows a did:jwk
    registry.
 4. Flip an entry in `vc-registry`'s status list — admin GUI at
-   <http://localhost:9004/admin/login> (`admin` / `e2e-admin-password`), or `GET
+   <http://localhost:9004/admin/login> (`admin`, with the password from
+   `fixtures/rendered-secrets/vcAdminGuiPassword`, generated per checkout), or `GET
    http://localhost:9004/statuslists/0` to read the Status List Token itself — and confirm the
    credential shows as revoked after re-verification. Note that credentials carry
    `registry.public_url` (`https://vc-proxy:8445`) as their `status_list.uri`, which is only
