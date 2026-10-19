@@ -685,13 +685,14 @@ credential to revoked or suspended, use the registry's admin GUI at
 `fixtures/rendered-secrets/vcAdminGuiPassword` — generated per checkout, no longer a fixed
 literal).
 
-One caveat when testing revocation end-to-end in a browser: the tokens' `iss`/`sub` — and the
-`status.status_list.uri` written into issued credentials — come from `registry.public_url`,
-which is `https://vc-proxy:8445`. That proxy is only defined in `docker-compose.conformance.yml`,
-so under a plain `make up VC=yes` the URI a credential points at isn't resolvable from the host
-browser, and the wallet treats an unfetchable status list as a warning rather than a failure
-(see [DIIP-V5.md](DIIP-V5.md)). Read the list directly on `:9004` to inspect it, or bring the
-stack up with `CONFORMANCE=yes` for a reachable `vc-proxy`.
+The tokens' `iss`/`sub` — and the `status.status_list.uri` written into issued credentials —
+come from `registry.public_url`, which is the registry's own host-reachable address
+(`http://vc-registry.localhost:9004`), so a plain `make up VC=yes` is enough to fetch a
+credential's status list from the host browser. This used to be `https://vc-proxy:8445`, a host
+only defined in `docker-compose.conformance.yml`, which made those URIs unresolvable outside
+`CONFORMANCE=yes`; see `fixtures/vc-config-golden/accepted-diffs.yaml` for the correction. The
+wallet still treats an unfetchable status list as a warning rather than a failure (see
+[DIIP-V5.md](DIIP-V5.md)).
 
 ## R2PS (Remote PAKE-Protected Signing)
 

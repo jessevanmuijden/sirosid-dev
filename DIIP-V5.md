@@ -35,7 +35,7 @@ dependency outside it, ➖ = optional in v5 and not implemented.
 | Requirement | Status | Where |
 | --- | --- | --- |
 | MUST support SD-JWT VC | ✅ | `wallet-common/src/credential-parsers/SDJWTVCParser.ts`, `credential-verifiers/SDJWTVCVerifier.ts` |
-| MUST support W3C VCDM secured with SD-JWT (VC-JOSE-COSE) | ✅ | `wallet-common/src/credential-parsers/VCDMSDJWTParser.ts`; verified by `SDJWTVCVerifier`, which resolves the VCDM `issuer` property as well as `iss` |
+| MUST support W3C VCDM secured with SD-JWT (VC-JOSE-COSE) | ✅ | `wallet-common/src/credential-parsers/VCDM2SdJwtParser.ts`; verified by `SDJWTVCVerifier`, which resolves the VCDM `issuer` property as well as `iss` |
 | MUST support ES256 | ✅ | key generation and signing throughout `wallet-frontend/src/services/keystore.ts` |
 
 VC-JOSE-COSE §3.2.1 gives a VCDM credential the `typ` header `vc+sd-jwt` — the same string the
@@ -68,10 +68,10 @@ flow until go-wallet-backend forwards that field, the same gap `authorization_de
 
 | Requirement | Status | Where |
 | --- | --- | --- |
-| Pre-Authorized Code Flow and Authorization Code Flow | ✅ | `wallet-frontend/src/lib/services/OpenID4VCI/OpenID4VCI.ts` |
-| `tx_code` in the Pre-Authorized Code Flow | ✅ | `OpenID4VCI.ts`, `TxCodeInputContext.tsx` |
+| Pre-Authorized Code Flow and Authorization Code Flow | ✅ | `wallet-frontend/src/hooks/useOID4VCIFlow.ts` drives the flow; the OAuth itself runs in the engine, `go-wallet-backend/internal/engine/oid4vci.go` |
+| `tx_code` in the Pre-Authorized Code Flow | ✅ | `wallet-frontend/src/context/TxCodeInputContext.tsx`, prompted over the transport from `internal/engine/oid4vci.go` |
 | MUST NOT assume the AS shares the Issuer's domain | ✅ | `OpenID4VCIHelper.getAuthorizationServerMetadata` resolves `oauth-authorization-server` separately |
-| PKCE with `S256` | ✅ | `OpenID4VCI/OAuth/PushedAuthorizationRequest.ts` |
+| PKCE with `S256` | ✅ | `go-wallet-backend/internal/engine/oid4vci.go` — the engine builds the authorization request, so PKCE lives there, not in the wallet |
 | PAR | ✅ | same — PAR is the only authorization request path |
 | Issuer-initiated flow | ✅ | `handleCredentialOffer` |
 | Same-device and cross-device Credential Offer | ✅ | URI handler and QR scanner both feed `handleCredentialOffer` |
@@ -89,7 +89,7 @@ one.
 
 | Requirement | Status | Where |
 | --- | --- | --- |
-| Same-device and cross-device flows | ✅ | `wallet-frontend/src/lib/services/OpenID4VP/OpenID4VP.ts` |
+| Same-device and cross-device flows | ✅ | `wallet-frontend/src/hooks/useOID4VPFlow.ts` |
 | Authorization Request passed by reference | ✅ | `OpenID4VPServerAPI.handleRequestUri` |
 | `get` value for `request_uri_method` | ✅ | same — `post` is rejected with `unsupported_request_uri_method` rather than silently downgraded |
 | `did` Client Identifier Scheme | ⚠️ | `OpenID4VPServerAPI.parseClientIdScheme` accepts the OID4VP `decentralized_identifier:` prefix and a bare `did:`. Works for did:web; **a did:jwk Verifier is still rejected** — see below |
@@ -175,8 +175,9 @@ Then:
    <http://localhost:9004/admin/login> (`admin`, with the password from
    `fixtures/rendered-secrets/vcAdminGuiPassword`, generated per checkout), or `GET
    http://localhost:9004/statuslists/0` to read the Status List Token itself — and confirm the
-   credential shows as revoked after re-verification. Note that credentials carry
-   `registry.public_url` (`https://vc-proxy:8445`) as their `status_list.uri`, which is only
-   reachable under `CONFORMANCE=yes`; see the README for details.
+   credential shows as revoked after re-verification. Credentials carry
+   `registry.public_url` as their `status_list.uri`, which is the registry's own
+   host-reachable address (`http://vc-registry.localhost:9004`) — a plain `make up VC=yes` is
+   enough to resolve it.
 
 Unit coverage lives beside the implementation in both repos (`yarn test`).
