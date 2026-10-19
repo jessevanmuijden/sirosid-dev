@@ -1,15 +1,278 @@
 # sirosid-dev — instructions for Claude Code
 
 This repo is a **harness, not a service**: it orchestrates sibling repos
-(go-wallet-backend, go-trust, vc, wallet-frontend, wallet-common, helm-charts)
+(go-wallet-backend, go-trust, vc, wallet-frontend, wallet-common)
 via a large self-documenting `Makefile`, docker-compose files, and Python
-scripts under `scripts/`. It has no application code of its own. Run
-`make help` for the authoritative, current list of targets/flags — this file
-only covers what `make help` and `README.md` don't: the non-obvious traps.
+scripts under `scripts/`. The only code of its own that runs inside an
+environment is `env-admin/` (the storage-reset service behind the
+dashboard's "Clear all data", ~one file) and the `mocks/`; everything else
+is orchestration. Run `make help` for the authoritative, current list of
+targets/flags — this file only covers what `make help` and `README.md`
+don't: the non-obvious traps.
+
+Three entry points share one core and must stay in step:
+- `make` — the CLI, and what CI runs.
+- the **boot manager** (installed by `make setup`, launched by `make boot`, `bootmgr/`) — a
+  Textual TUI that only ever runs `make` commands it shows first.
+- `scripts/stack.py` — the `make up` option matrix as data (`make plan`).
+  The Makefile still builds `COMPOSE_FILES` itself; `tests/test_stack_parity.py`
+  fails when the two disagree, so **adding a compose overlay or flag means
+  editing both** (and its help string in `stack.py`'s `OPTIONS`, which is
+  where the TUI's per-field help comes from).
+
+## `sirosid_core/` — the part that is not a command line
+
+`scripts/` is the CLI (argv, the developer's gitignored files, printing).
+`sirosid_core/` is what a CLI **and** a hosted service can both call, and it
+never reads argv, the environment or a developer's disk:
+
+- `spec.py` — `InstanceSpec`, a content-only description of one instance
+  (PEM text and key material, not file paths). Strict `from_dict`: an unknown
+  key is an error. `fly-up.py` builds one in `_spec_from_args()`, which is where
+  every file read and the file-vs-CLI merge now live.
+- `naming.py` — `Naming`: Fly app names, `.internal` addresses, **public
+  hostnames** and the network, derived in one place. Default is the historical
+  `sirosid-<env>-<component>` / `*.fly.dev`; `--app-prefix` / `--host-pattern`
+  (or `app_prefix:` / `host_pattern:` in `environments/<name>.yaml`) change it.
+  Never write `f"sirosid-{env}-..."` again — take a `Naming`.
+
+- `components.py` / `assets.py` / `android.py` — the component registry
+  (`build_components(mini_oidc_image, env_admin_image)`: the two pins from
+  `values-fly.yaml` are parameters, the library reads no repo file) and the pure
+  generators (fly.toml, nginx configs, dashboard, assetlinks). `fly_common.py`
+  re-exports them.
+- `fly.py` — `FlyClient(org, token, runner, ...)`: the flyctl operations as an
+  object (any org, any identity, injectable runner, raises `FlyError`).
+  `fly_common.py` keeps the old function names as a facade over one default
+  client and turns `FlyError` into `SystemExit`.
+- `state.py` — which files of an instance's working directory are **state**
+  (`mongoRootPassword`, `jwtSecret`, `adminToken`, `apiAuthKey.pem`, `vc-pki/`)
+  and `StateStore`/`workdir()` to carry them through a database. **If you add a
+  value that is generated once and handed to Fly (which cannot give it back),
+  add it to `STATE_FILES`** — `tests/test_state.py` redeploys from exported
+  state alone and fails when something is missing.
+- `tests/test_core_layering.py` keeps the package a library: no imports from
+  `scripts/`, no `__file__`/`SIROSID_DEV_ROOT`, no `open()`.
+
+- `lifecycle.py` — `destroy_instance(fly, naming, keep_data)`: what `fly-down`
+  does, as a call that reports (`DestroyReport`) and keeps going past a failed
+  app, so a TTL reaper never leaves the rest billing. `fly-down` takes
+  `--app-prefix` for instances deployed with one.
+- `resources.py` — `Resources(root)`: where the chart, `values-*.yaml` and
+  `fixtures/` are. The CLI points it at the checkout; a service at what it
+  ships. The library never walks up from `__file__` to find them.
+- `render.py`, `vc_render.py`, `api_auth.py`, `helm.py` — the renderer
+  (`render()` needs `resources=`). `scripts/render-helm-config.py` is the CLI over
+  it; `scripts/{vc_render,api_auth,helm_render_lib}.py` are aliases so old
+  imports resolve to the package module. `scripts/bootstrap.py` is **not** moved —
+  the env-admin image copies it as a standalone file — so the library takes
+  registration as an injected `register(...)` callable.
+- `deploy.py` — `deploy_instance(spec, fly, naming, resources, ...)`: `fly-up`
+  as a library call. Prints nothing (progress goes to a callback), exits nothing
+  (raises `DeployError` with `.component` / `.deployed`), acts as the
+  `FlyClient`'s org and token. `scripts/fly-up.py` is now argument parsing,
+  `_spec_from_args()` and the summary.
+
+- `singlemachine.py` (+ `machines.py`, `oci.py`) — the **single-machine layout**
+  (`InstanceSpec.layout="single-machine"`, `fly-up --single-machine`): ONE app
+  `<prefix>-<env>` with ONE multi-container machine made through the Machines API, instead
+  of ~11 apps. Every component listens on its own loopback port (`naming.SINGLE_MACHINE_PORTS`,
+  always reached through `Naming.addr`); a front nginx inside wallet-frontend's nginx routes
+  by Host, so `host_pattern` must be FLAT (`{component}-{id}.<domain>`); large files ship
+  in a per-instance bundle image pushed without docker; secrets reach containers only via an
+  init container (app secrets and `files[].secret_name` do NOT reach API-created
+  containers). Real-Fly limits that shaped it: ~1 MiB config body, and **at most ~12 block
+  devices** (each distinct image, image volume, volume) - a 13th makes Firecracker fail with
+  `ResourceNotAvailable` and the machine sits in `created`. env-admin and conformance are
+  refused. fly-down / fly-power (`stop|start|reset`) need `--single-machine` (no
+  detection: the default path's command sequence is characterized).
+- `edge.py` (+ `edge/`, `scripts/edge-up.py`) - the **shared edge** in front of single-machine
+  instances with no public IPs: one Fly app holding `*.<domain>` + the apex certs, answering
+  `<component>-<id>.<domain>` with `fly-replay: app=sid-<id>;timeout=10s;fallback=prefer_self`
+  and serving the apex/www static site itself (`console.<domain>` is the console's own app, not
+  the edge's). Real-Fly facts it encodes: the replay header comes from a `map` that is empty
+  unless the exact flat shape matches, and is never `add_header ... always` (that would replay
+  404s); the raw Host is checked too ($host drops a trailing dot and a port); a stopped target
+  comes back as `fly-replay-failed` -> a 503 page; instances must stay on the org's DEFAULT
+  network (cross-network replay is refused); the edge never proxies or answers an Upgrade
+  itself; its app name must not start with `sid-`. `tests/test_edge.py` runs an adversarial Host
+  corpus through a Python mirror and through real nginx (docker). Measured through a real edge
+  (2026-10-05): ~2 ms replay overhead; websockets and 20 MB bodies pass intact; **a replay
+  STARTS a stopped machine even with autostart off**, so stopping a single-machine instance
+  cordons it (`lifecycle`) and start/reset/deploy uncordon - only then does a stopped instance
+  get the edge's 503 page (at the 10 s timeout); a replay to an app that does not exist is
+  Fly's empty 502 after ~7 s (no fallback); a client's `X-Forwarded-Proto` reaches the instance
+  verbatim (only `Fly-Client-IP` is replaced), so the behind-edge front sends `https` itself.
+- `tests/test_fly_up_characterization.py`'s vc-*.yaml hashes depend on the gitignored
+  `fixtures/rendered-secrets/vc*` of the checkout that wrote the golden: a fresh worktree
+  fails it until those files match.
+
+To call the deploy from a service:
+`state.workdir(store, id, subdir=f"fly-{env}")` -> `deploy_instance(spec, fly, naming,
+Resources(root), rendered_root=<yielded dir>, register=..., progress=...)`.
+`tests/test_deploy_instance.py` is the worked example.
+
+## `sirosid_service/` — the control plane (no HTTP/MCP/auth layer yet)
+
+Sits on top of `sirosid_core` (never the other way: a layering test enforces it) and
+holds every rule about who may do what: users and single-use **invites** (admin-issued,
+only a hash stored), per-user **quotas** and a global cap, saved **configs** validated by
+`sirosid_core.policy` against the caller's *current* capabilities (re-checked at create
+time, so a withdrawn grant bites), instance ownership (someone else's id and a
+nonexistent one are indistinguishable), **keep** allowances, an audit log, a TTL
+**reaper**, `lapse_kept()` (a lapsed allowance gets a day's grace, never instant
+deletion) and an orphan **sweeper** (only apps matching exactly
+`<prefix>-<8 id chars>-<known component>`, destroyed after a grace period). Instance
+state lives in SQLite (`DbStateStore`, with `seal`/`unseal` hooks where encryption at
+state lives in SQLite. **A user's data is sealed under a key only their passkey can
+produce** (`vault.py`; the wallet's privatedata-spec model: one main AES-256-GCM key,
+wrapped per passkey in the browser from the WebAuthn PRF output, stored by the server as
+an opaque container). The browser unlocks it and hands the server the main key for the
+session only (`ControlPlane.begin_session`; held in memory, never persisted, capped at
+24 h). Configs, specs and instance secrets are sealed under it with AAD binding owner and
+object; ids, owners, status, expiry and `naming` stay plaintext, so stop, start, destroy,
+the reaper and the sweeper work with nobody logged in, while deploy, reset, reading a
+config or an instance's credentials raise `Locked` without a session. Admins cannot read
+users' data and a database dump or backup holds none. Without `cryptography` (see
+`sirosid_service/requirements.txt`) the service tests skip. with only the service's own org credential
+(stop, destroy the Mongo machine and volume, redeploy) so service instances need no
+in-instance Fly credential: the platform sets `PlatformPolicy.env_admin=False`, which
+`InstanceSpec.env_admin` (also `fly-up --no-env-admin`) turns into no env-admin app, no
+nginx `/_admin/` + health proxy, no dashboard Storage card and no per-consumer token
+minting. (Beware when editing `wallet_frontend_conf`: it once had a local named
+`env_admin` holding the *hostname*, which silently shadowed the boolean parameter.)
+Front ends authenticate a caller into a `Principal` and
+call `ControlPlane`; they must not reimplement any check. `tests/test_service.py` runs
+all of it against the fake flyctl.
+
+### Front end of the control plane: `auth.py`, `api.py`, `__main__.py`
+
+- `auth.py` — passkey enrolment (invite + ceremony; the invite is only spent if the
+  ceremony succeeds), discoverable-credential login, web sessions (tokens stored hashed),
+  and `unlock` (the browser derives the main key from the passkey's PRF output
+  client-side and hands the server the key; the PRF output never reaches the server).
+  One constant PRF salt is advertised for every credential. Every verification failure
+  returns the same message. The server cannot verify PRF support (the client reports it
+  unsigned): the browser must refuse to enrol an authenticator without it.
+- `api.py` — a thin Starlette skin over `ControlPlane`; **it decides nothing**, so a rule
+  added there would be one MCP and the CLI lack. It owns only the web's own risks:
+  `__Host-sid` cookie (HttpOnly, SameSite=Strict, no Domain), an Origin allow-list on
+  every state-changing request (a cookie alone never authorises a write), JSON-only
+  size-capped bodies, per-client rate limits on the endpoints that take guesses, strict
+  security headers and no caching. Status mapping: 401 not signed in, 423 locked, 422
+  policy problems (all at once), 409 quota/invalid state, 404 for another user's or a
+  nonexistent id and for admin routes a member calls.
+- `python -m sirosid_service serve | admin-invite`; configuration from the environment
+  (`config.py`: `FLY_API_TOKEN` is required, origins must be https and under the RP ID, the
+  host pattern must vary per instance). The first admin gets a **bootstrap invite** from
+  `admin-invite` (refused once an admin exists) and enrols a passkey like anyone else.
+- The console is **`console.sirosid.dev`** and that SUBDOMAIN is the RP ID (permanent: changing
+  it orphans every passkey). **Hard rule: nothing untrusted, and in particular no instance
+  content, may ever be served at or under `console.sirosid.dev`** - any page there may request
+  the console's passkeys. Instances are its SIBLINGS (`<component>-<id>.sirosid.dev`, through
+  the shared edge), isolated by that RP ID choice and, once submitted, by the PSL; `config.py`
+  refuses (`instance_host_may_be`) any host pattern that could reach the RP ID or an origin host.
+  `SIROSID_LAYOUT=single-machine` defaults the rest of that shape: `SIROSID_INSTANCE_DOMAIN=sirosid.dev`,
+  host pattern `{component}-{id}.<domain>`, `SIROSID_PUBLIC_IPS=false`, apps `sid-<id>`.
+- `console/` — the web UI, served by the service itself (`ApiConfig.console_dir`, env
+  `SIROSID_CONSOLE_DIR`; only `index.html`, `js/`, `css/` from a table built at startup, so
+  `console/test/` is never reachable). Plain ES modules, **no build step and no dependencies**.
+  Pages get their own CSP (`script-src 'self'`, no inline script or style, no handlers);
+  `tests/test_console_static.py` fails on inline code, `innerHTML`/`eval`, or web storage.
+  `js/container.js` is the key container (the privatedata-spec key layer, WebCrypto only;
+  our own HKDF info string so a PRF output is never confusable with the wallet's);
+  `js/webauthn.js` converts options and **strips the PRF output from everything sent to the
+  server**; the page is flat ES modules in `js/` (the server serves no subdirectories): `app.js` (sign-in pages and the chat | environment | library workspace), `store.js` (state, bus, 401/423 handling, the ~4 s status poll), `ui.js` (`h()`, modal with focus trap, popover, toast), `keys.js` (passkeys + container), `chat.js`/`chatlogic.js` (the assistant pane; the queue and approval gate are pure and mutation-tested), `env.js`, `library.js`, `settings.js`, `format.js`; the DOM is built with `createElement`/`textContent` only and a newer endpoint that 404s without an API error code is treated as absent (its tab is hidden). Enrolment refuses
+  an authenticator without `prf.enabled` before finish, then takes a second touch for the PRF
+  output. Adding a passkey stores the new container *before* registering the credential, so a
+  failure never leaves a passkey that cannot open it. The main key lives in page memory only: a
+  reload keeps the server session unlocked but needs a new sign-in to add/remove passkeys.
+  `tests/test_console_js.py` runs the Node tests (`node --test console/test/*.test.mjs`) and a
+  Python cross-implementation check of the container format; run the service tests with `.venv`.
+- `oauth.py`, `mcp.py`, `mcp_web.py` — the MCP server (`POST /mcp`, JSON-RPC, JSON responses only,
+  no sessions, no batching) and the minimal OAuth 2.1 AS it needs (dynamic registration of
+  PUBLIC clients, code + mandatory S256 PKCE, no refresh tokens, no secrets). The only login is
+  the console's passkey login: `/oauth/authorize` parks the request and redirects to
+  `/#authorize=<id>`, the console shows consent, and **approving clones the user's key session**
+  (`SessionKeys.clone`): the application gets a bearer token for its own handle on the
+  server-held key - never the key - which dies on its 8 h clock, when revoked in the console's
+  "Connected apps" tab, when the user is disabled, or on restart (codes, tokens and keys are
+  memory-only; only registered clients are stored). So **token validity == key-session
+  validity**, and console sign-out does not kill an agent. Tools are one `ControlPlane` call
+  each as the token's Principal - decide nothing there; administrative actions, passkeys and the
+  key container are deliberately not tools. `/mcp` refuses a browser `Origin` that is not ours
+  (DNS rebinding). `tests/test_mcp.py` covers the flow and is mutation-checked (PKCE, redirect,
+  origin, replay and key-session revocation each fail a test when removed).
+  Besides tools the server offers **resources** (`sirosid://knowledge/<topic>` text/markdown,
+  `sirosid://templates/<id>` JSON - only the templates the user's capabilities allow -,
+  `sirosid://schema/config`; an unknown URI is JSON-RPC `-32002`) and **prompts = the platform's
+  skills** (`skills.py`: `spin-up-environment`, `reconfigure-environment`, `add-trusted-party`,
+  `test-android-passkeys`, `diagnose-environment`, `clean-up-environments`): each renders a runbook
+  naming the tools to call in order. A runbook names only tools in the table (a test parses every
+  backticked name against the tool table and the config schema - **renaming a tool means fixing
+  `skills.py`**) and only knowledge topics that exist at render time, always with a search step, so
+  it stays right while the knowledge base changes. Prompt arguments are strings, validated (bad =
+  `-32602`). `initialize`'s `instructions` tell clients to read the knowledge and prompts first.
+- **Environments** (the console's one concept; the API calls them instances, and an instance's config
+  is part of it): `ControlPlane.reconfigure_instance(who, id, config | config_name)` validates the new
+  config against the caller's CURRENT capabilities (all problems at once, 422), rebuilds the spec with
+  `policy.rebuild_spec` - which keeps the deployed spec's `PLATFORM_FIELDS` (env, region, prefix, host
+  pattern, layout, public IPs, ...), so a platform that switched layouts never deploys a second copy -
+  and redeploys in the background through the same job as create/reset, keeping data and generated
+  state (apps: every component redeploys, changed ones restart; single-machine: the machine config is
+  updated, which restarts the machine). **The working config is never lost**: the new spec/config are
+  sealed into `pending_*` columns and replace the instance's own only after the redeploy succeeded; a
+  failure ends `failed` with an error saying the previous config is still in place (reconfigure again
+  with it to go back), and the commit is guarded on `status='reconfiguring'` so a destroy or the reaper
+  meanwhile wins. Allowed from `running`/`failed`; **a stopped instance is refused ("start it first")**
+  because a redeploy starts every machine (`ensure_running`, the machine update) - applying a config
+  would silently start and bill it. Statuses: creating, running, stopped, resetting, reconfiguring,
+  failed, destroyed (stopping/starting reserved). The public instance dict carries `config_name` (the
+  NAME of the saved config it was made from or last reconfigured with, plaintext like the label; null
+  for an inline config), `layout` and `reconfigurable`. Reads: `get_instance_config` (the instance's
+  own sealed snapshot; needs the unlock), `instance_health` (`sirosid_core/health.py`: Machines API for
+  both layouts, apps probed in parallel, per-call timeout, no retries, an overall budget; never raises -
+  `components: []` + `error`; names and states only, never machine config) and `instance_activity`
+  (audit rows allow-listed by action AND detail key: a target is a bare string, and a saved config may
+  be named like an instance id). Routes: `GET /api/instances/{id}/config|health|activity`, `POST
+  /api/instances/{id}/reconfigure` (202), `GET /api/examples`, `GET /api/knowledge[/{id}]`. Older
+  databases get the new columns from `Database._migrate`.
+- `sirosid_core/knowledge/` - **what the platform knows** (Markdown topics with front matter +
+  `examples.yaml`; `list_topics/get_topic/search/overview/examples`), served to the console, to MCP
+  (tool `get_knowledge`, resources) and folded into the assistant's system prompt (`overview()`). It
+  is package DATA: `tests/test_control_plane_deploy.py` rebuilds the image tree and loads it there.
+- `llm.py`, `chat.py`, `chat_web.py` — the **assistant** (console "Assistant" tab), enabled when
+  `OPENROUTER_API_KEY` (a Fly secret) is set; `SIROSID_CHAT_MODELS` (comma list, first is default)
+  defaults to `openrouter/auto` (OpenRouter's router picks per request; whether it always routes to a
+  tool-capable model is unverified - check before relying on it); per-user and
+  global daily token budgets (`SIROSID_CHAT_USER_DAILY_TOKENS`/`..._GLOBAL_...`, table `chat_usage`).
+  It is the MCP tool table driven by a model, acting only as the unlocked signed-in user, so it can
+  do nothing the console cannot. What is special: a model provider sees the user's messages and tool
+  results (requests ask OpenRouter for `data_collection: deny`; the UI says so); the credentials
+  tool is **not offered** and admin actions are not tools; `chat.REQUIRES_APPROVAL` (reconfigure,
+  reset, destroy, delete config) and every `destructiveHint` tool **pause for an Approve click** bound
+  to the exact tool call id (`confirm` is single-use, per user); tool output is data (system prompt
+  says so) and the console renders everything as text. One running turn per user, step limit,
+  bounded history/tool output. Conversations are server memory only. The system prompt adds
+  `knowledge.overview()` and, when `POST /api/chat` carries `active_instance` and the user owns it, one
+  line of that environment's METADATA (id, label, status, expiry - never config). `focus_environment`
+  is a console-only tool (not in the MCP table; ownership-checked). The turn streams SSE (`status/tool/
+  tool_result/confirm/message/error/done`, plus `focus {instance_id}` and, after every mutating tool
+  call, `refresh {what: ["instances","configs"]}`). `tests/test_chat.py` uses a scripted fake model
+  against the real tools and HTTP layer; the approval gate (reconfigure included), withheld tool, call
+  binding, focus/active-instance ownership, refresh, budget and unlock checks are mutation-checked.
+- `sirosid_core/templates.py` — **starting-point configs** (standard stack, SIROS registry, wallet
+  attestation, DC API, interop, custom wallet-backend image). Plain data: a template is a saved config
+  plus a title/description/hints/`requires`; `ControlPlane.templates(who)` offers only those the user's
+  capabilities allow (`GET /api/templates`, MCP `list_config_templates`, the Configs tab's "Start from a
+  template"). `tests/test_templates.py` validates every template through `policy.validate`, so one
+  cannot rot behind a policy change; adding a config key means deciding whether a template shows it.
+- `tests/softauthn.py` is a software authenticator (real authenticator data, COSE keys,
+  signed assertions) so passkey verification is exercised, not mocked.
 
 ## Sibling repo layout
 
-`make setup` clones (or, for `helm-charts`, fast-forwards) these into `../`:
+`make setup` clones these into `../`:
 
 | repo | branch | notes |
 |---|---|---|
@@ -19,9 +282,8 @@ only covers what `make help` and `README.md` don't: the non-obvious traps.
 | `go-trust` | `main` | trust PDP |
 | `vc` | `main` | SUNET/vc issuer/verifier/apigw/registry — only needed for `VC=yes` |
 | `facetec-api` | `main` | only needed for `FACETEC=yes` |
-| `helm-charts` | `main` | **read-only config-rendering source**, not branched for feature work. `make setup` auto-`git pull --ff-only`s it if it's on `main`; if checked out to something else (e.g. a PR branch someone's deliberately testing), it's left alone with a warning. |
 
-`make update` force-hard-resets every repo above (except helm-charts) to its
+`make update` force-hard-resets every repo above to its
 default branch — destructive, only run it when you actually want to discard
 local changes in the sibling checkouts.
 
@@ -34,8 +296,7 @@ local changes in the sibling checkouts.
 - **Named Fly.io environments (`make fly-up ENV=<name>` / `fly-down` /
   `fly-status`)** — a full, independently-addressable, shareable stack at
   `sirosid-<env>-*.fly.dev` URLs under the `sirosfoundation` Fly org, region
-  `arn`. Images are pulled straight from `helm-charts/siros-id-stack`'s
-  `values.yaml` (layered with `values-fly.yaml`) — **no local Docker build** by
+  `arn`. Images are pulled straight from `chart/values.yaml` (layered with `values-fly.yaml`) — **no local Docker build** by
   default. Use this for: handing a URL to someone else, native
   Android/iOS app testing (real assetlinks/AASA over real TLS), OIDC-backed
   issuance (mini-oidc needs to be reachable from a real browser redirect, not
@@ -45,13 +306,38 @@ local changes in the sibling checkouts.
   environment can't resolve another's `.internal` addresses).
 
 Both paths share one underlying mechanism: `scripts/render-helm-config.py`
-renders wallet-backend/PDP config from the same `helm-charts/siros-id-stack`
-chart, just with different hostname targets (`--target fly` uses
-`.internal`/`.fly.dev`, the local `PDP=helm` path uses compose service names).
-This is why `PDP=helm` locally and any `fly-up` deploy are the two contexts
-where a stale/wrong `../helm-charts` checkout will silently produce wrong
-config — always check `git -C ../helm-charts branch --show-current` if PDP
-behavior looks off in either mode.
+renders **every** service's config — wallet-backend, the PDP, and the four vc
+services (issuer-apigw, issuer-core, issuer-registry, verifier) — from the
+same in-repo chart (`chart/`), just with different hostname targets (`--target
+fly` uses `.internal`/`.fly.dev`, compose uses `*.localhost` service
+aliases). Nothing is hand-maintained in parallel any more:
+`fixtures/vc-config.yaml` and the four mechanically-patched copies of it are
+gone, along with `generate-tunnel-config.py`, `generate-android-config.py`
+and `patch-vc-config-fly.py`.
+
+Values layering, later wins (`values-base.yaml` → `values-dev/fly.yaml` →
+per-run generated overlay → `environments/<name>.yaml`'s `values:` block).
+Every mode that used to need its own pre-patched config file is now just a
+different hostname set: TUNNELS, DOMAIN, Android/Waydroid, CONFORMANCE.
+
+**`chart/` is ours.** It began as the SIROS ID Stack Helm chart
+(sirosfoundation/siros-id-stack, at our PR #3 + `mdoc_iacas_uri` + issuer BBS)
+and is now maintained here, deliberately more generic than the production
+chart: it exists to expose every knob sirosid-dev needs, where the production
+chart exposes only what a deployment wants. Helm is used purely as the template
+engine (`helm template`; only the ConfigMaps are consumed), so the k8s-only
+templates in it are dead weight to prune, not something to keep in sync. The
+upstream chart reverted the `extraConfig` design this repo relies on
+(2026-09-29) and silently ignores unknown values keys, so tracking it would
+have produced stacks that boot with the wrong config. Compare against
+upstream by hand when a feature there is worth porting — don't merge it.
+
+**`make vc-config-parity`** renders the chart for both targets and
+semantically diffs the result against checked-in goldens
+(`fixtures/vc-config-golden/`), with every accepted difference justified in
+`accepted-diffs.yaml`. Run it after touching the chart, `values-base.yaml`,
+or the renderer — it is the only thing that catches a template edit quietly
+dropping a field this repo depends on.
 
 ### `make up` — key flags (see `make help` for the full, current list)
 
@@ -59,9 +345,48 @@ behavior looks off in either mode.
   wallet-backend + PDP config from the chart (see above); the other modes are
   hand-maintained env vars/CLI flags, kept independently and known to drift
   from the chart (that's the whole reason `PDP=helm` exists — see
-  "Helm alignment" below).
+  "Helm alignment" below). Note `VC=yes` renders the vc services' config from
+  the chart regardless of `PDP=`, so `helm` is now only about wallet-backend
+  and the PDP themselves.
+- `ENV=<name>` — layers `environments/<name>.yaml` onto a local `make up` too,
+  not just `fly-up`. Its `values:` block is free-form chart values merged last,
+  so a one-off override needs no code change anywhere. Its `local:` block
+  supplies defaults for every `make up` option (`pdp`, `vc`, `transport`, ...
+  — `scripts/stack.py`'s `OPTIONS`), applied by the Makefile as plain
+  assignments so a flag on the command line still wins for that run.
+- **Storage:** Mongo lives in its own overlay (`docker-compose.mongodb.yml`),
+  loaded whenever the VC services are on **or** `PDP=helm` — the chart-rendered
+  wallet-backend config points at `mongodb://mongodb`, and before the overlay
+  `make up PDP=helm` without `VC=yes` pointed at a host that never started.
+  Its volume `sirosid-mongodb-data` survives `make down` (`make clean` and
+  `make storage-clear` remove it). wallet-backend in every non-helm mode is
+  an **in-memory** store — a container restart empties it; `make plan` and the
+  dashboard's Storage card both say so. Clearing while up goes through
+  env-admin (stop consumers → drop databases → start → wait healthy →
+  `scripts/bootstrap.py` re-registers issuer/verifier). The restart is not
+  optional: wallet-backend creates its default tenant and vc-apigw imports
+  its bootstrap documents **only at startup**, so a wipe without a restart
+  leaves a stack that looks healthy and cannot issue.
+- `AS_RULES=allow-all|baseline` — SPOCP policy for wallet-backend's built-in
+  Authorization Server (passkey login + token endpoint), separate from the
+  `PDP=` trust policy above. Default `allow-all` (`fixtures/as-rules/`) is an
+  unconditional allow — local dev's job is a working AS for every client
+  (web + native SDK) out of the box, not exercising the AS ruleset itself.
+  `baseline` swaps in go-wallet-backend's own real policy (`rules/` in that
+  repo) — the same one `make fly-up` gets by default, since it never sets
+  `WALLET_AS_RULES_DIR` and go-wallet-backend's `EnableForRole()` falls back
+  to its image-baked rules when unset. Use `baseline` only when directly
+  testing AS rule behavior, e.g. reproducing a Fly-only 403 locally.
+- `REGISTRY=vendored|external` — where credential type metadata comes from.
+  `vendored` (default) renders each type's VCTM/MDDL from `fixtures/vc-metadata`
+  into the chart's `vctms` ConfigMap. `external` drops the documents entirely
+  and resolves each scope by identifier — `vct` for `dc+sd-jwt`, `doctype` for
+  `mso_mdoc` — from `CREDENTIAL_REGISTRIES` (ordered, later overrides earlier).
+  Honored identically by `make up` and `make fly-up`; persistable per
+  environment as `credential_registries:` in `environments/<name>.yaml`.
 - `VC=yes` — adds production-like issuer/verifier/apigw/registry + mongodb,
-  built from `../vc`.
+  built from `../vc`. Requires `helm`, since their
+  config is rendered from `chart/`.
 - `TRANSPORT=websocket|wmp|http` — wallet transport; `http` is deprecated.
 - `CONFORMANCE=yes` — layers in VC services + VC↔go-trust wiring
   (`docker-compose.vc-go-trust.yml`) and the OpenID conformance suite overlay,
@@ -94,18 +419,138 @@ behavior looks off in either mode.
   no manual `docker tag`/`push`/`flyctl auth docker` needed. A fully-qualified
   ref (has a `/`) is always passed through untouched even if it's also
   cached locally.
+- `REGION=<code>` — where this environment's machines go. **You usually don't
+  need it**: with nothing pinned, `fly-up` asks Fly where to run and takes its
+  answer — the anycast edge nearest you, the same thing `fly launch` picks.
+  Contributors are in different places, so that's the right default. Note it's
+  Fly's *routing* view, not raw geography: from Stockholm it answers `fra`,
+  not `arn`.
+
+  Pin it when you want to, most specific first: `REGION=` →
+  `environments/<name>.yaml`'s `region:` → `$FLY_REGION` → a gitignored
+  `.fly-region` (copy `.fly-region.example`). Only if Fly is unreachable does
+  it fall back to `arn`. Every run prints which it used and why.
+
+  A **named, shared** environment should pin `region:` in its own file, so it
+  doesn't land somewhere different depending on who redeployed it; the
+  personal default is for scratch environments (`ENV=alice`) that have no file.
+
+  `primary_region` is a preference, not a constraint — it's where Fly places
+  the *first* machine. Changing it does **not** move machines that already
+  exist. Since Mongo got a volume, a volume also **pins** its app to its
+  region: `fly_common.ensure_volume` refuses a run targeting another region
+  while a volume exists, so relocating means clearing the data first
+  (`make fly-storage-clear ENV=<name>`, or `fly-down` without `KEEP_DATA`).
+- **Storage on Fly:** `mongodb` and `conformance-mongodb` mount a Fly volume
+  (`fly_common.STORAGE_APPS`, created by `fly-up` if missing). Data survives
+  redeploys, image bumps and host maintenance. `fly-down` destroys apps and
+  therefore volumes — a teardown deletes the data — unless `KEEP_DATA=yes`,
+  which leaves the two Mongo apps with machines stopped and keeps
+  `fixtures/rendered/fly-<env>/` (it caches the root password, see the gotcha
+  below). `env-admin` (11th app, deployed right before wallet-frontend) is the
+  reset actor; it holds one app-scoped deploy token per Mongo consumer
+  (minted every `fly-up`, never an org token) to stop/start them through the
+  Machines API. Its image is `values-fly.yaml`'s `images.envAdmin`; if that
+  pin isn't pullable (first release, or you're testing an env-admin change)
+  `fly-up` builds `env-admin/Dockerfile` locally and pushes it into the app's
+  registry.fly.io namespace — the one place `fly-up` builds anything.
 - `ANDROID_APPS=` — same as local (see above).
 - `CONFORMANCE=yes` — deploys 3 extra apps (`conformance-mongodb`,
   `conformance-server`, `conformance` nginx front) after the core 10.
 - `TRUSTED_ISSUERS=url,...` — ad-hoc external issuers for interop testing
   (e.g. a third-party mdoc issuer). **Only ever added to `pid_issuers`, never
-  to `verifiers`** — there is no `TRUSTED_VERIFIERS` equivalent today. See the
-  PDP gotcha below before assuming this covers "trust as a verifier" too.
+  to `verifiers`** — use `TRUSTED_VERIFIERS=identity,...` for that instead.
+  See the PDP gotcha below before assuming either covers the other.
+- `TRUSTED_VERIFIER_ROOTS=path,...` — PEM CA cert file path(s) to merge into
+  PDP's system CA pool (go-trust#123+), for a verifier whose request-signing
+  cert is issued by a self-signed "reader CA" root meant to be trusted
+  out-of-band rather than a public CA. See the PDP gotcha below.
+
+## Credential metadata: two components, one list
+
+Two components independently need each type's metadata document, and when they
+disagree **nothing errors** — the wallet just holds a credential it can never
+present:
+
+- **vc** — the issuer builds the credential from it; the verifier derives its
+  DCQL presentation queries from it (`common.credential_registry`)
+- **go-wallet-backend** — its registry serves it to the wallet, which renders
+  and DCQL-matches against it (`registry.yaml`'s `sources`)
+
+`REGISTRY=external` therefore sets both from one `--credential-registries`
+value, in one render (`scripts/render-helm-config.py`). There is no second
+place to keep in step — which there used to be, four of them, before the vc
+services' config was rendered from the chart.
+
+The identifiers each scope switches to are read out of
+`values-base.yaml`'s `features.credentialTypes`, the same values the chart
+already renders `supported_credentials` and the VCTM mounts from, so the
+vendored and registry-resolved paths cannot drift apart while both exist.
+
+Both paths use each registry's legacy `.well-known/vctm-registry.json` index,
+**not** its TS11 `/api/v1/schemas.json` endpoint. TS11 lists only fully
+TS11-compliant credentials — 26 entries on registry.siros.org today against 37
+in the legacy index — so switching would silently drop every type not migrated
+yet. That is the obvious "modernisation" to reach for; don't, until the two
+agree.
+
+### Synthetic documents: what `fixtures/vc-bootstrapping` guarantees
+
+Every datastore-sourced type is issued from a document in
+`fixtures/vc-bootstrapping/<scope>.json`, keyed by mini-oidc user id. Three
+invariants hold, and `tests/test_fixture_integrity.py` is what holds them —
+run it after touching anything under `fixtures/vc-bootstrapping` or
+`fixtures/vc-metadata`. Each one guards a failure that is **silent**: the
+stack issues the wrong credential, or refuses with a message that points at
+the wrong thing.
+
+- **The document's identity is the login identity.** PID-authenticated
+  issuance resolves the holder by matching the presented PID's
+  `given_name`/`family_name`/`birth_date` against `identity_mappings.json`.
+  A document whose person drifted from mini-oidc's `users.yaml` fails with
+  "no documents", which reads like a missing fixture rather than a
+  mismatched one — it hid three broken natural persons until 2026-09-18.
+  A mapping with no `birth_date` fails the same way for any type whose
+  `authOptions.scopes` matches on `birthdate`.
+- **Every claim is declared** by that type's VCTM/MDDL. Nothing errors on an
+  undeclared claim; the issuer drops or rejects it depending on version.
+- **Minimal + exactly one `-full`.** Each scope has documents covering only
+  the mandatory claims, and exactly one whose `meta.document_id` ends in
+  `-full`, covering mandatory *and* every optional claim, so both shapes of
+  a credential are testable without editing fixtures. One holder owns the
+  `-full` document per scope; two documents of one scope for one holder make
+  issuance ambiguous. README.md has the per-scope table.
+
+What vc main actually matches on, read from its code (2026-10-13):
+`ResolveIdentifier` (internal/apigw/apiv1/handlers_issuer.go) takes only the
+*unqualified* keys `given_name`/`family_name`/`birth_date` out of the
+extracted auth claims. An SD-JWT PID's `birthdate` must be disclosed but is
+never compared; an mdoc claim outside `org.iso.18013.5.1` (written
+`<namespace>.<element>` in `authOptions.scopes`, or the DCQL path is wrong)
+matches nothing, so `pid_mdoc`/`photoid` cannot authenticate yet; and an mdoc
+date is never usable as an auth claim - it decodes to a CBOR tag 1004, and a
+non-string identity claim fails the whole presentation.
+
+`nym_auth` (values-base.yaml has the long comment) is the first type
+authenticated by mdocs as well as PIDs, and its birth date is meant to be
+copied from the presented credential. vc main cannot copy a presented claim
+into a datastore document, so the chart renders
+`auth_scopes.<x>.document_claims`/`identity_attributes` for a proposed vc
+change and vc main ignores them; until then the document's own `birth_date`
+is issued, and `tests/test_fixture_integrity.py` (`NymAuth`) holds it equal to
+the birth date in every credential that person can present. Its `ssc`/`psc`
+are TEMPORARY fixed test commitments (README.md lists the seeds) until vc
+supports per-holder seeds.
+
+Derived age claims are recomputed from the birth date at test time, so they
+fail the suite rather than rot. Adding or changing a document needs a
+storage clear or a `make datastore-upload` on an existing environment — see
+the datastore-import gotcha below.
 
 ## Why `values-fly.yaml` overrides exist (don't remove without checking)
 
-`helm-charts/siros-id-stack/values.yaml`'s own image pins lag behind what this
-repo needs; `values-fly.yaml`'s `images:` block patches specific components:
+`chart/values.yaml`'s image pins are a snapshot of what siros-id-stack shipped
+and lag behind what this repo needs; `values-fly.yaml`'s `images:` block patches specific components:
 
 - **`images.pdp`** — pinned to a specific `go-trust` tag ahead of the chart's
   own (pre-release, commit-sha) default, because the chart's default predates
@@ -184,44 +629,128 @@ have.
 
 **wallet-backend crash-loops with `Failed to load backend configuration`
 after bumping `images.walletBackend` past go-wallet-backend v0.10.0, if
-`helm-charts`' wallet-backend template sets `wallet_provider.wia.enabled:
+the chart's wallet-backend template sets `wallet_provider.wia.enabled:
 true`:** v0.10.0 added a hard startup-time validation
 (`pkg/config/config.go`'s `WIAConfig.WalletVersion` check) requiring
 `wallet_provider.wia.wallet_version` whenever `wallet_provider.wia.mode`
 defaults to `"etsi"` (EC TS03 v1.5.2 §2.3.1 made it a mandatory WIA claim,
 with no sensible built-in default per that field's own comment) — `wia.
 enabled: true` with no `wallet_version` alongside it fails config validation
-and the backend never comes up. As things stand, `helm-charts`' `main` branch
+and the backend never comes up. As things stand, `chart/`
 doesn't render a `wallet_provider.wia` block in
-`siros-id-stack/templates/04-wallet-backend.yaml` at all yet — the Key
-Attestation work that adds one lives on the (unmerged)
-`feat/wallet-provider-key-attestation-config` branch, where the
-`wallet_version` fix currently exists only as an **uncommitted** local edit
-in whatever checkout added it. So this isn't a live bug on `main` today, but
-it will be the moment that branch's `wallet_provider.wia` block lands
-anywhere upstream — if you're touching that template, always pair
-`wia.enabled: true` with a `wallet_version` (this repo uses go-wallet-
-backend's own version as the value) in the same change, and don't assume an
-uncommitted fix in a sibling `helm-charts` checkout survives a stash/reset.
+`templates/04-wallet-backend.yaml` at all, so this isn't a live bug today —
+but if a future chart update adds one, always pair `wia.enabled: true` with a
+`wallet_version` (this repo uses go-wallet-backend's own version as the
+value) in the same change.
 
 **`scripts/render-helm-config.py --target fly --env <name> ...` run by
 itself (not via `make fly-up`) without `--mongo-password <value>` silently
 renders a Mongo connection URI with no credentials at all:** `mongo_password`
 defaults to `None`, and `patch_wallet_backend_fly()` does `mongo_auth =
 f"root:{mongo_password}@" if mongo_password else ""` — empty string, not an
-error. This happens because `fly-up.py`'s `main()` generates a fresh random
-`mongo_password` per invocation and sets it as *both* the mongodb app's own
-Fly secret (`force=True` — rotated every full `fly-up` run) *and* the value
-baked into the rendered config; the two are only guaranteed consistent within
-the same `fly-up.py` invocation. Hand-rendering one component's config to
-tweak a single field, then `flyctl deploy`-ing just that app, silently breaks
-that component's Mongo auth, because the freshly-rendered password won't
-match whatever's still set as the mongodb app's actual Fly secret from the
-last full `fly-up` run. For any single-field config tweak, just re-run `make
-fly-up ENV=<name>` again instead of hand-rolling a partial `flyctl deploy` —
-confirmed idempotent/safe, it redeploys every component with fresh,
-mutually-consistent config+secrets rather than clobbering anything that's
-already there.
+error. The password is the one in `fixtures/rendered/fly-<env>/mongoRootPassword`
+(`fly-up.py`'s `resolve_mongo_password()`): it is **no longer rotated per
+run** — the Mongo volume's data was initialised with it and
+`MONGO_INITDB_ROOT_*` never re-applies to a non-empty `/data/db`. If that
+cache is missing but the environment has a volume (someone else deployed it
+last), `fly-up` reads the password back from the running mongodb machine over
+`fly ssh console` (a `--file-secret` is readable from inside; the API cannot
+read secrets back) and refuses to continue if that fails, since deploying a
+guessed password would lock every consumer out of data nobody can then
+reach. For any single-field config tweak, just re-run `make fly-up ENV=<name>`
+— idempotent, redeploys every component with mutually-consistent config and
+secrets.
+
+**A new datastore-sourced credential type (or new bootstrapping document)
+issues fine on a fresh `make up` but fails with "no documents" on an
+existing environment after a redeploy:** vc-apigw's importer only loads
+`datastoreImport.documents` and the identity mappings into an **empty**
+datastore - its log says `Datastore already contains data, skipping import`.
+Redeploying does not add the new documents. Clear the environment's data
+(dashboard Storage card, `make storage-clear`, `make fly-storage-clear
+ENV=<name>`), which restarts apigw into an empty datastore so the import
+runs with every document - or, when the environment holds data worth
+keeping, add just the new documents without a wipe:
+
+```bash
+make datastore-sync DRY_RUN=yes [ENV=<name>]     # what would change
+make datastore-sync [ENV=<name>]                 # make it match the fixtures
+make datastore-search SCOPE=<scope> [ENV=<name>]
+```
+
+`datastore-sync` reconciles the whole of `fixtures/vc-bootstrapping` -
+documents added, replaced and removed, plus `identity_mappings.json`, which
+the same importer skips and whose drift fails issuance with "no documents",
+pointing at the documents rather than at the mapping. `SCOPE=` narrows it to
+one type (and then leaves the shared mappings alone). `make datastore-upload
+FILE=...` still adds a single file's documents, and is the right thing when
+the environment holds documents you deliberately don't want reconciled away.
+
+One trap if calling the API directly: the bulk endpoint's body is a map keyed
+by holder, so one call can only carry one document per holder - fine for a
+bootstrapping file, one scope per file, and the reason `datastore-sync` sends
+one call per scope.
+
+The import gap bit the EU Business Wallet types (`ebw_oid`/`eucc`/`eu_poa`,
+all PID-authenticated datastore types) on gdc, 2026-09-10; `iban_ov` was
+added to gdc this way on 2026-09-12, and on 2026-09-18 a `datastore-sync`
+brought gdc up to the reworked fixtures (12 documents added, 10 replaced, 7
+renamed away, 3 identity mappings given the birth dates the PID match needs).
+
+**Issuing to a wallet on another device (no browser on the phone, no OIDC
+login there):** vc-apigw mints a pre-authorized credential offer for any
+datastore document, and the offer carries its own code, so the wallet that
+scans it needs no session of its own:
+
+```bash
+make datastore-offer SCOPE=pid_1_8 QR=yes [DOCUMENT_ID=<id>] [ENV=<name>]
+```
+
+It prints an `openid-credential-offer://` URL and, with `QR=yes`, the QR the
+SDK sample app's scanner reads (it registers that scheme). With no
+`DOCUMENT_ID` it takes the scope's only document, or its `-full` one. This
+works for the PID-authenticated types too: the document is named here rather
+than resolved from a presented PID, which is the whole point of the
+pre-authorized grant. The code expires 5 minutes after minting, so generate
+it when the phone is in your hand.
+
+**The issuer and the verifier show the SUNET logo:** they are showing vc's
+built-in assets, which means `common.branding` never reached them. The chart
+points `logo_path`/`favicon_path` at `/branding-assets/*.png` and expects an
+initContainer to decode them there from the `branding` ConfigMap; there is no
+initContainer here, and vc validates a branding path as a real PNG at startup
+even when it is empty (`panic: validation:image_png field:logo_path`), so the
+whole block used to be stripped. `vc_render.write_branding_assets` now does
+the initContainer's job at render time, writing
+`fixtures/rendered/branding-assets/{logo,favicon}.png`, which compose mounts
+and `fly-up` ships with `--file-local`. Check that directory exists before
+looking anywhere else.
+
+To use something other than the chart's default (the SIROS ball), name a PNG
+in this repo - `features.branding.logoDataUrl: {file: fixtures/...}`, and the
+same for `faviconDataUrl` - in `values-base.yaml` or in an environment's
+`values:` block. The chart's own literal `data:image/png;base64,...` form
+still works; the `{file: ...}` reference is resolved to exactly that before
+the chart sees the values, the same way credential-type documents are.
+
+**vc-apigw's `/api/v1/*` (datastore, identity mappings) answers 401 to a
+plain request - or, before 2026-09-15, answered anything to anyone:** the
+admin API takes a Bearer JWT. The chart renders `api_server.api_auth` (JWKS
+at `/main-config/api_auth_jwks.json` plus the SPOCP rule granting
+`/api/v1/*` to `admin@<tenant.id>`); `scripts/render-helm-config.py`
+generates the EC key behind it per target (`fixtures/rendered-secrets/
+apiAuthKey.pem` for compose, `fixtures/rendered/fly-<env>/apiAuthKey.pem`
+for Fly, reused across renders like every other generated secret) and
+`scripts/api_auth.py` mints 5-minute tokens from it - `make datastore-token`
+for a raw one. Until 2026-09-15 `vc_render.strip_unrenderable` deleted the
+block instead, on the grounds that nothing could mint the token, which left
+the datastore API open on every environment's public URL (found on gdc
+2026-09-12; nothing indicates it was used). Two consequences worth knowing:
+a Fly environment deployed by someone else has its key in *their*
+`fly-<env>/` directory, so your `make datastore-*` against it fails with 401
+until you have that file (same story as `mongoRootPassword`); and the JWKS
+is baked into the running config, so a key you regenerate only takes effect
+after the next render + deploy.
 
 **PDP boot appears stuck / "Issuer not trusted" right after `fly-up` with
 `TRUSTED_ISSUERS=` set (or any PDP redeploy with it already set):**
@@ -236,12 +765,29 @@ is deliberately still added to `pid_issuers` despite the slow-boot cost,
 because a resolution-only trust check doesn't need the JWKS to have actually
 resolved). Separately: if testing wallet-initiated *presentation* against an
 external verifier, `TRUSTED_ISSUERS`/`extra_trusted_issuers` is **only** added
-to `pid_issuers`, never `verifiers` — check
+to `pid_issuers`, never `verifiers` — use `TRUSTED_VERIFIERS=` for that
+instead (`make fly-up ENV=<name> TRUSTED_VERIFIERS=identity,...`); check
 `fixtures/rendered/fly-<env>/pdp.yaml`'s `whitelist.lists.verifiers` if a
-presentation-trust failure looks like it should've been covered by an issuer
-whitelist entry. There's no flag to add one today; it'd need a new
-`render-helm-config.py` parameter (see `scripts/render-helm-config.py`'s
-`build_fly_values_overlay()`).
+presentation-trust failure looks like it should've been covered but wasn't.
+`TRUSTED_VERIFIERS` entries must be the exact string go-trust's
+`WhitelistRegistry` compares against *after* its own `Subject.ID`
+normalization, confirmed via a live PDP rejection: an `x509_hash:...`
+`client_id` is left un-normalized (safe to paste verbatim from the wallet's
+"not trusted" error log), but `x509_san_dns:<host>`/`x509_san_uri:<uri>`
+values get normalized to `https://<host>`/`<uri>` before any whitelist match
+runs — an entry written in the original `x509_san_dns:`/`x509_san_uri:` form
+(the shape go-trust's own docs example at `docs/docs/sirosid/trust/go-trust.md`
+uses) silently never matches. Separately, if a whitelisted `x509_san_dns:`/
+`x509_san_uri:` verifier's request-signing certificate is issued by a
+long-lived, self-signed "reader CA" root rather than a public CA (a real
+ISO 18013-5 convention, not a misconfiguration — confirmed live for
+`verifier.multipaz.org`, whose signing cert is distinct from its ordinary
+publicly-CA-issued HTTPS cert), whitelist membership alone won't help:
+`TrustX509ViaSystemCA`'s chain-validation step still runs for these two
+schemes and can never succeed against a self-signed root. Use
+`TRUSTED_VERIFIER_ROOTS=<path,...>` (go-trust#123+, PEM cert file paths,
+repeatable/comma-separated) to merge that root into PDP's system CA pool
+instead — see `fixtures/trusted-roots/README.md` for a worked example.
 
 **vc-apigw/vc-issuer crash-looping on Fly with an `mdl`/mdoc-schema config
 error (`unexpected end of JSON input` / `vctm_file_path ... required_without`):**
@@ -256,10 +802,66 @@ back to whatever's pinned in `values-fly.yaml` — check
 `flyctl status -a sirosid-<env>-vc-apigw`/`-vc-issuer` after any redeploy of
 an environment you didn't build from scratch yourself.
 
+**Every credential type fails at `POST /credential` while `/token` succeeds,
+locally but NOT on `make fly-up`:** the browser shows only "Credential
+issuance failed" - a sanitized constant from go-wallet-backend's
+`ErrorCode.UserFacingMessage()`, never the reason. Never try to diagnose one
+of these from the console. The reason is in **vc-apigw's** log, and (with the
+issuer's raw response body) in wallet-backend's *debug* log, which
+`docker-compose.test.yml` already enables via `WALLET_LOG_LEVEL=debug`:
+
+```bash
+docker logs vc-apigw-e2e 2>&1 | grep -iE "VCICredential|proofs verification|/credential"
+docker logs wallet-backend-e2e-test 2>&1 | grep -i "credential endpoint error"
+```
+
+The local-only part is the real clue, and it generalizes well beyond this one
+bug: **`make up` builds vc, go-wallet-backend and wallet-frontend from your
+sibling checkouts, while `make fly-up` deploys the pinned images in
+`values-fly.yaml`.** Local therefore runs *current source on both sides of
+every protocol boundary*, and Fly runs a matched, older, known-good set. Any
+spec-conformance tightening that landed in one repo but not the other shows
+up locally and nowhere else - and reads as "Emil's machine is broken" rather
+than as a real interop bug. When a failure is local-only, diff the two sides,
+don't hunt for environment state.
+
+Worked example (fixed 2026-08-24, go-wallet-backend
+`fix/key-attestation-typ-spelling`): vc's apigw validates the Key Attestation
+JWT header with `eq=key-attestation+jwt`
+(`pkg/openid4vci/proof_attestation.go`) - the hyphenated media type
+OpenID4VCI 1.0 registers in Appendix G.6.2 - while go-wallet-backend emitted
+the pre-1.0 draft spelling `keyattestation+jwt`. Every credential type using
+the `attestation` proof type failed at once, because the proof type is chosen
+per issuer, not per credential. `siros-sdk-kotlin` and multipaz already used
+the hyphenated form; go-wallet-backend was the outlier. Two other repos still
+carry the old spelling (`go-r2ps-service`, `wallet-backend-server`) - check
+them before assuming a KA interop failure is new.
+
+A *different* local-only divergence with the same shape: mini-oidc is the one
+local-stack service pulled from a registry rather than built from a sibling
+checkout, so it's the only one that can differ between two machines that both
+changed nothing. It used to default to an unpinned `:main`, which docker never
+re-pulls once cached; it's now pinned from `values-fly.yaml`'s
+`images.miniOidc` via the Makefile's `MINI_OIDC_VERSION`, so local and Fly
+move together. Check with `docker image inspect
+ghcr.io/sirosfoundation/mini-oidc:$MINI_OIDC_VERSION --format '{{.Created}}'`.
+
 **Fly networking, in general:**
 - 6PN (Fly's internal network) is **IPv6-only** — a component binding only
   IPv4 (`mongod`'s default) is unreachable from sibling apps over
-  `.internal` unless it's explicitly told to bind `--ipv6` too.
+  `.internal` unless it's explicitly told to bind `--ipv6` too. Bit
+  env-admin 0.1.0 the same way (Python's `HTTPServer(("", port))` is
+  IPv4-only): wallet-frontend's `/_admin/` proxy 502'd while the machine's
+  own health check passed, since that check is local. Any new component
+  must listen on `::` (dual-stack) — see `DualStackHTTPServer` in
+  `env-admin/server.py`.
+- **Scale to zero is per ENVIRONMENT, never per app.** `make fly-stop ENV=x` stops
+  every machine (apps and the Mongo volume are kept; only the volume is billed) and
+  `make fly-start ENV=x` brings them back in deploy order, waiting for health.
+  Deploying with `--scale-to-zero` also sets `auto_start_machines = false`, so a stray
+  request cannot wake one machine in front of a stopped backend (verified on real Fly:
+  without it, a single request to a stopped environment woke only the frontend).
+  `--org <org>` on `fly-up`/`fly-down`/`fly-power.py` targets a dedicated org.
 - **Autostart only fires on the public edge**, never for internal 6PN calls
   between sibling apps — an internal-only component left on
   `auto_stop_machines='stop'` goes idle and *stays* stopped forever once a
@@ -303,6 +905,10 @@ an environment you didn't build from scratch yourself.
   Fly-related rather than re-deriving it from scratch.
 - `scripts/render-helm-config.py`'s `build_fly_values_overlay()` — the
   whitelist/mdociaca construction referenced above.
+- `scripts/stack.py` (`make plan`) — the `make up` option matrix as data, with
+  each option's help; `scripts/storage.py` (`make storage-*`) — storage from
+  outside an environment; `env-admin/server.py` — the reset from inside;
+  `bootmgr/sirosid_bootmgr/harness.py` — everything the TUI knows, no UI.
 
 ## Working conventions
 
@@ -311,6 +917,23 @@ an environment you didn't build from scratch yourself.
   changes here unprompted, and never run `make fly-up`/`fly-down`/anything
   Fly-touching without confirming no one else has a deployment for that
   `ENV=` name in progress (`flyctl apps list`/`fly-status ENV=<name>` first).
+  `fly-down` now also **deletes the environment's data** (volumes go with the
+  apps) unless `KEEP_DATA=yes` — ask before a plain `fly-down` of a shared
+  environment.
+- Tests: `python3 -m unittest discover -s tests -p 'test_*.py'` (stack
+  parity needs `make`; the fly-up tests need `helm` and `openssl`; nothing needs
+  Docker or Fly — `tests/fakefly.py` is a stateful fake `flyctl`).
+  **`tests/test_fly_up_characterization.py` is the safety net under any change to
+  the deploy path**: it runs the real `fly-up.py` against the fake and compares
+  the exact command sequence and every rendered file with `tests/golden/`. A
+  deliberate change refreshes it with `UPDATE_GOLDEN=1`; an accidental one fails. Run it after touching
+  the Makefile's compose logic, `scripts/stack.py`, `env-admin/`, or the Fly
+  scripts' pure parts.
+- `env-admin/` changes ship as an image: bump `VERSION` in `server.py`, push a
+  `env-admin-v<version>` tag after merge (`.github/workflows/env-admin-image.yml`
+  publishes `ghcr.io/sirosfoundation/sirosid-env-admin:<version>`), and bump
+  `values-fly.yaml`'s `images.envAdmin`. Local `make up` builds it from the
+  checkout regardless.
 - `values-fly.yaml` and `.golden-releases.yaml` are checked-in, shared
   defaults — changes to them affect every developer's next `fly-up`/`GOLDEN=`
   run, not just yours. `.android-apps`, `.env*` files are gitignored,

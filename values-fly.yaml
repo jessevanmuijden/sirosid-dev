@@ -13,13 +13,13 @@ features:
   generateSecrets: false
   credentialTypes: {}
 
-# Not consumed by sirosid-dev's Fly deployment yet (issuer/verifier alignment
-# beyond vc-services' existing fixtures/vc-config.yaml is a follow-up), but
-# 04-issuer.yaml `fail`s the whole render without one of these set.
-issuer:
-  apiAuth:
-    jwks:
-      enabled: true
+# The chart's own default is "" (no longer a non-empty placeholder as of the
+# siros-id-stack chart) - required for 04-wallet-backend.yaml/
+# 04-wallet-frontend.yaml's HTTPRoute parentRefs to render at all; this is
+# never applied to a real cluster, so any placeholder value works here.
+gateway:
+  name: gateway
+  namespace: siros-shared
 
 replicas:
   pdp: 1
@@ -35,29 +35,350 @@ images:
   # per-environment IMAGES= override (for ad-hoc testing, e.g. your own
   # branch build - this is NOT that, this is fixing a broken shared default).
   #
-  # helm-charts' own images.pdp pin (siros-id-stack/values.yaml) is a
+  # siros-id-stack's own images.pdp pin (values.yaml) is a
   # pre-release commit-sha tag that predates the AllowHTTP fix
   # (sirosfoundation/go-trust#112) the PDP's config-file whitelist needs to
   # become healthy at all once deployed on Fly - not optional polish, every
   # environment needs this or JWKS fetch fails for every whitelisted entity.
   #
-  # DELETE this override once helm-charts bumps images.pdp past v0.9.2 -
+  # Bumped from 0.9.2 to 0.12.1: 0.9.2 also predates TrustX509ViaSystemCA
+  # (go-trust#120, whitelisting a verifier identified by a non-JWKS-fetchable
+  # client_id scheme like x509_hash:.../x509_san_dns:...) and its follow-up
+  # certificate-binding fix (go-trust#121) - without both, the whitelist
+  # registry's config-file trust_x509_via_system_ca flag is silently a no-op
+  # (the running binary doesn't have the code path at all) and every such
+  # verifier is denied with "no keys cached for entity" regardless of
+  # whitelist membership - confirmed live against digital-credentials.dev and
+  # verifier.multipaz.org.
+  #
+  # Bumped from 0.12.1 to 0.13.0: 0.12.1 still requires full system-CA chain
+  # validation even for x509_hash-pinned entities (go-trust#122) - digital-
+  # credentials.dev and verifier.multipaz.org are both self-signed/non-CA-
+  # chained, so they were whitelisted via x509_hash but still denied at the
+  # chain-validation step. 0.13.0 skips chain validation unconditionally for
+  # the x509_hash scheme (hash-pinning already IS the trust decision), while
+  # x509_san_dns/x509_san_uri still require full chain validation as before.
+  #
+  # Bumped from 0.13.0 to 0.14.0: 0.13.0 skips chain validation for
+  # x509_hash-pinned entities but still requires full system-CA chain
+  # validation for x509_san_dns/x509_san_uri entities. verifier.multipaz.org's
+  # OpenID4VP request-signing certificate (x509_san_dns scheme) is issued by a
+  # self-signed "verifier.multipaz.org Reader CA" root - deliberate, per the
+  # ISO 18013-5 reader-root convention (confirmed via multipaz's own source:
+  # a locally-generated, cached root, not a misconfiguration) - so it fails
+  # chain validation even though it's whitelisted. go-trust#123 adds
+  # AdditionalTrustedRoots: extra PEM roots merged into the system CA pool
+  # specifically for this chain-validation step, without pinning a leaf cert
+  # that would break on the verifier's next signing-key rotation. Wired here
+  # via TRUSTED_VERIFIER_ROOTS= (see fixtures/trusted-roots/).
+  #
+  # Bumped from 0.14.0 to 0.14.1: purely a diagnostic-observability fix
+  # (go-trust#124) - WhitelistRegistry.deny() now logs its specific reason
+  # (not-in-list vs. certificate-binding-check failure vs. chain-validation
+  # failure) at INFO level. Previously that reason was computed and returned
+  # in the AuthZEN response body but never logged anywhere server-side,
+  # making a live denial (e.g. verifier.multipaz.org's "verifier not
+  # trusted") impossible to root-cause from PDP/wallet-backend logs alone.
+  # No behavior change.
+  #
+  # Bumped from 0.14.1 to 0.15.0: real behavior fix (go-trust#126). Go's x509
+  # parser rejects certificates with a negative serial number by default
+  # since Go 1.23 (RFC 5280 recommends non-negative but doesn't forbid it -
+  # openssl and every other major TLS stack accept them fine). This is
+  # exactly what verifier.multipaz.org's actual reader-CA root has -
+  # confirmed live by capturing its real signed request directly from its
+  # dcBegin endpoint and decoding the x5c chain: openssl verify succeeds,
+  # but AppendCertsFromPEM silently failed to add the root to the pool,
+  # making the whole AdditionalTrustedRoots mechanism (go-trust#123, wired
+  # here via TRUSTED_VERIFIER_ROOTS=) a no-op for exactly the verifier it
+  # was built to support. 0.15.0 sets GODEBUG=x509negativeserial=1 in the
+  # image, fixing this without weakening any other trust check.
+  #
+  # Bumped from 0.15.0 to 0.15.1: real behavior fix (go-trust#127). The
+  # AdditionalTrustedRoots field itself (go-trust#123) was never mirrored
+  # onto go-trust's own YAML-config-loading struct, so it was silently
+  # dropped for every Fly deployment - TRUSTED_VERIFIER_ROOTS= has been a
+  # no-op the whole time, independent of the negative-serial fix above.
+  # Confirmed via a temporary debug print in a locally-built binary that
+  # AdditionalTrustedRoots was empty at runtime despite correct config;
+  # verified end-to-end afterward against the real captured
+  # verifier.multipaz.org leaf cert: denied before this fix,
+  # decision=true/trust_path=system_ca after.
+  #
+  # Bumped from 0.15.1 to 0.18.0 (#132): cmd/gt/main.go never wired brainpool
+  # curve support into any of the six registries that accept a CryptoExt
+  # extension point, so any brainpool-curve root cert (e.g. the real Geneva
+  # 2026 RICAL/VICAL root, brainpoolP256r1) crashed the PDP process outright
+  # on every boot with "x509: unsupported elliptic curve" - exhausting Fly's
+  # restart budget. Also picks up the mdocrical/vical registries themselves
+  # (#123, #131) needed to evaluate RICAL/VICAL trust lists at all.
+  #
+  # Bumped from 0.18.0 to 0.19.0: routine catch-up to the latest release, not
+  # a fix for anything broken here. The only functional changes between the
+  # two tags are confined to pkg/registry/rpcert (service-level WRPAC-WRPRC
+  # binding and a telephoneNumber Subject DN attribute, #110) plus
+  # pkg/registry/x5c_enrichment.go and a Go/dependency refresh - the rpcert
+  # registry isn't one this stack configures (we run whitelist + mdocrical/
+  # vical), so nothing in the rendered PDP config changes shape.
+  #
+  # Bumped from 0.19.0 to 0.20.4: 0.19.0 predates go-trust#148/#151 - without
+  # them, mdocrical denies any reader whose chain doesn't exactly appear in
+  # the RICAL (rather than validating against its trust anchors), AND
+  # enforces CertificateInfo.IsTrustAnchor as a gate even though the ISO
+  # 18013-5 organizers have confirmed that field is being removed from the
+  # standard - real published RICALs (e.g. Geneva 2026's) already omit it.
+  # Without this bump, gdc's Scytales reader interop test fails at the PDP
+  # with "reader certificate chain not present in RICAL" despite Scytales
+  # being explicitly listed in the RICAL by name.
+  #
+  # Bumped from 0.20.4 to 0.20.5: 0.20.4 predates go-trust#153 - without it,
+  # WhitelistRegistry's additional_trusted_roots parses PEMs via stdlib
+  # crypto/x509 directly, which can't handle brainpoolP256r1 (used by real
+  # ISO 18013-5/eIDAS reader-CA roots, e.g. Geneva 2026's OpenID4VP verifier
+  # root) - and one such root failed the *entire* registry's CA pool
+  # construction, denying every other whitelisted verifier too. Confirmed
+  # live 2026-08-31 against gdc: adding geneva2026.mdoc.online's root without
+  # this fix broke trust for verifier.multipaz.org as a side effect.
+  #
+  # Bumped from 0.20.5 to 0.20.6: 0.20.5 predates go-trust#159 - configuring
+  # the ETSI TSL registry from a config file silently dropped tsl_urls (and
+  # follow_refs, max_ref_depth, allow_network_access, user_agent and
+  # fetch_timeout), so the registry started with nothing to load and exited
+  # with "no trust data loaded" while the config plainly named a TSL. Only
+  # tsl_files worked. Needed here for the WRPAC/WRPRC trust anchors, which are
+  # published as both a LoTE and a TSL.
+  #
+  # Bumped from 0.20.6 to 0.20.7: 0.20.6 cannot trust a verifier that
+  # identifies itself the way OpenID4VP 1.0 says to. The specification carries
+  # the DID client_id scheme as a prefix - decentralized_identifier:did:web:...
+  # - and NormalizeSubjectID did not strip it, so the did:web registry refused
+  # the identifier as not a DID and the whitelist denied it for want of cached
+  # keys a DID has no JWKS endpoint to supply. Confirmed live against
+  # Accredify's ACRA verifier: presentation fails on 0.20.6 and works on
+  # 0.20.7 (go-trust#165). 0.20.7 also carries grpc 1.83.2 for GO-2026-6348
+  # and GHSA-2v4p-qf9q-27wj.
+  #
+  # DELETE this override once siros-id-stack bumps images.pdp past v0.20.7 -
   # pdp should be sourced from the chart like every other component, with
-  # zero special-casing here.
-  pdp: "ghcr.io/sirosfoundation/go-trust:0.9.2"
+  # zero special-casing here. (Chart's own pin is still 0.9.0 as of this
+  # commit, so it has not caught up.)
+  pdp: "ghcr.io/sirosfoundation/go-trust:0.20.7"
 
-  # helm-charts' own images.walletBackend pin (siros-id-stack/values.yaml)
+  # siros-id-stack's own images.walletBackend pin (values.yaml)
   # is 0.6.1, well behind the wallet-provider Key Attestation work this repo
   # is exercising - kept as a local override rather than bumped upstream
-  # since helm-charts versions are maintained on their own release process.
-  walletBackend: "ghcr.io/sirosfoundation/go-wallet-backend:0.10.0"
+  # since siros-id-stack versions are maintained on their own release process.
+  #
+  # Bumped from 0.10.0 to 0.11.0: 0.10.0 predates commit ae1c6ea ("fix(wia):
+  # send both c_nonce and nonce claims on Key Attestation", #265, first
+  # released in 0.10.1) - without it, the Key Attestation JWT's nonce claim
+  # doesn't match what a spec-conformant issuer expects, and Geneva 2026's
+  # issuer (geneva2026.mdoc.online) rejects every credential request with
+  # invalid_nonce - confirmed live via its own conformance report.
+  #
+  # Bumped from 0.11.0 to 0.11.1 (#272): defaults JARM (direct_post.jwt)
+  # content encryption to A128GCM instead of A128CBC-HS256 when a verifier's
+  # client_metadata doesn't declare a preference, and actually calls
+  # submitErrorResponse (with its redirect_uri threaded through) when the
+  # user declines a presentation - both confirmed live against
+  # verifier.multipaz.org.
+  #
+  # Bumped from 0.11.1 to 0.14.0 (#279): allowlists the "mdoc-reader-auth"
+  # SPOCP action so the wallet's RICAL reader-trust AuthZEN calls
+  # (siros-sdk-kotlin#113/siros-sdk-swift#110) actually pass through the
+  # authzen_proxy instead of being denied as an unrecognized action.
+  #
+  # 0.14.0 -> 0.14.1: three fixes, of which one matters here. #280 stops the
+  # wallet silently falling back to a non-PAR authorization when the AS
+  # requires PAR - a behaviour change, so a client relying on that fallback
+  # now surfaces an error instead of proceeding. #281 moves the registry's
+  # TS11 schemas.json fetch to go-ts11client. #282 (allow_http for
+  # URL-subject issuer resolution) is a no-op for Fly, which is HTTPS
+  # throughout - it was needed for local http:// stacks.
+  #
+  # 0.14.1 -> 0.15.0: #289 fixes the Key Attestation JWT's typ header, which
+  # said "keyattestation+jwt" (the pre-1.0 OpenID4VCI draft spelling) where
+  # the registered media type is "application/key-attestation+jwt". Issuers
+  # pin the JOSE short form exactly - vc's apigw validates it with
+  # `eq=key-attestation+jwt` - and reject the whole credential request rather
+  # than falling back to the jwt proof type, so this failed EVERY credential
+  # type at once wherever it fired.
+  #
+  # It has not fired on Fly yet, and that is luck rather than design: the
+  # images.issuer* pins below are 0.7.0-sirosid.1 (2026-08-11), which predates
+  # vc's bd10e120 (2026-08-19) advertising the "attestation" proof type for
+  # every scope. A wallet picks its proof type from what the issuer
+  # advertises, so an issuer offering only "jwt" never exercises the Key
+  # Attestation path. THE FIRST BUMP OF THE issuer*/verifier PINS PAST
+  # 2026-08-19 WOULD HAVE BROKEN ISSUANCE ON EVERY FLY ENVIRONMENT. Bumping
+  # here first removes that ordering trap; do not reintroduce it by pinning
+  # walletBackend back below 0.15.0.
+  #
+  # Also in 0.15.0: #284 makes GET /issuer/:id/metadata embed the issuer's own
+  # logos/SVG templates as data: URIs (they are otherwise fetched
+  # cross-origin by the wallet to substitute claim values, and render broken
+  # when the host sends no Access-Control-Allow-Origin). Asset delivery only -
+  # nothing is substituted from the registry, and an unreachable or oversized
+  # image leaves the issuer's original URL untouched.
+  #
+  # 0.15.0 -> 0.15.2 (skipping 0.15.1, never pinned here): #296 allowlists the
+  # "mdoc-issuer-auth" SPOCP action through the authzen_proxy (mirrors #279's
+  # "mdoc-reader-auth" fix above, same class of gap). #298 recognizes the
+  # "x509_hash" client_id_scheme and the "mdoc-openid4vp://" URI scheme -
+  # needed for a NIST reference verifier that used both during Geneva 2026
+  # interop testing.
+  #
+  # 0.15.2 -> 0.16.0: #302 restores the `client_status` (WIA) and
+  # `key_storage_status` (KA) claims that WE BUILD CS-04 §7.1.2/§7.1.3
+  # require on every Wallet Unit Attestation. They were removed in 0.10.0
+  # (#261) because this wallet provider implements no revocation-chaining -
+  # true, but not a licence to omit the claims: a CS-04-conformant PID or
+  # Attestation Provider rejects a WUA without them outright. The WE BUILD
+  # ITB testbed does exactly that ("Key Attestation missing required
+  # key_storage_status"), which is what blocked the ITB run. Both claims now
+  # point at the wallet provider's own Token Status List, served all-VALID
+  # and never revoked - the short WIA/KA lifetimes are still what actually
+  # bound exposure here, so this changes what a WUA *says*, not what it
+  # guarantees.
+  #
+  # Also in 0.16.0: the KA emitted no key_storage/user_authentication/
+  # certification at all when a client omitted security_properties. All
+  # three are required on every KA, so each now falls back to the weakest
+  # ISO 18045 value rather than being absent.
+  #
+  # Nothing here needs a config change on Fly: status_list defaults to
+  # enabled and derives its URI from server.base_url, which the chart
+  # already sets to the public wallet-backend hostname
+  # (siros-id-stack/templates/04-wallet-backend.yaml), so the URI a WUA
+  # references is publicly resolvable.
+  #
+  # 0.16.0 -> 0.17.0: #304 adds the engine-driven `request_attestation`
+  # sign step. The per-flow OAuth-Client-Attestation PoP must name the
+  # issuer's authorization server as `aud`, which is only known after the
+  # engine has resolved the offer and issuer metadata - so the engine now
+  # asks the client for WIA + PoP at that point instead of expecting them
+  # up front on FlowStart (still honoured when present). This is what lets
+  # wallet-frontend (wallet-frontend#196) attest at all: a browser cannot
+  # fetch a cross-origin credential_offer_uri itself. Client compatibility:
+  # an SDK/frontend build that predates the action never answers, and the
+  # engine gives up after 10s and proceeds unattested - so older native
+  # app builds keep working against this env with a one-off delay per
+  # issuance until siros-sdk-kotlin#154 / siros-sdk-swift#122 ship. The
+  # stacked follow-ups that drop the SDKs' own discovery (kotlin#156,
+  # swift#123) require an env on this version or newer.
+  #
+  # No config change needed here: the step is unconditional in the engine
+  # and has no knobs.
+  #
+  # Bumped from 0.17.0 to 0.18.0: adds the issuer entitlement check
+  # (go-wallet-backend#306) that /v1/resolve returns as issuer_entitlement -
+  # under CIR (EU) 2025/848 a PID or attestation provider is a registered
+  # wallet-relying party in its own right, and ARF v3.0.0 section 6.6.2.3 asks
+  # the wallet to verify its registration before requesting issuance. The
+  # clients that act on the decision are siros-sdk-kotlin#157,
+  # siros-sdk-swift#124 and wallet-frontend#279.
+  #
+  # Left in its default warn mode: WALLET_AUTHZEN_PROXY_ISSUER_ENTITLEMENT_MODE
+  # is unset, so findings are reported and issuance still proceeds. The ARF
+  # obligation only applies 24 months after the amending Regulation enters into
+  # force, and this env issues from vc-issuer, whose WRPAC/WRPRC come from
+  # `make wrpac-pki` and are not yet part of every deployment here. Set it to
+  # `fail` to exercise refusal.
+  #
+  # Bumped from 0.18.0 to 0.18.4: picks up the go-webauthn 0.18 upgrade and
+  # the fix for it (go-wallet-backend#312). Skip 0.18.1 (does not build),
+  # 0.18.2 (rejects every WebAuthn sign-up and login with "Client returned the
+  # prf extension output which was not requested") and 0.18.3 (tagged on the
+  # wrong commit, same code as 0.18.2).
+  #
+  # Bumped from 0.18.4 to 0.22.1. Everything between is release history this
+  # default simply never took; what matters to an environment deployed today:
+  #   0.20.0  sign_client_auth, the client-held DPoP key
+  #   0.21.0/0.22.0  the no-matching-credential fast fail (#336) and OpenID4VP
+  #        1.0's `decentralized_identifier` client_id scheme (#343) - without
+  #        the latter a verifier built against the final specification is
+  #        refused before its request is read
+  #   0.22.1  the SSRF address guard on POST /helper/get-cert (#358), and a
+  #        recover() registered before the flow_id log truncation so a panic
+  #        in handleFlowStart is caught rather than taking the process (#357)
+  walletBackend: "ghcr.io/sirosfoundation/go-wallet-backend:0.22.1"
 
-  # helm-charts' own vc.* pins (siros-id-stack/values.yaml) are still
+  # siros-id-stack's own vc.* pins (values.yaml) are still
   # v0.6.5-sirosid.4, well behind the mdoc/BLE proximity and DC API fixes
   # this repo is exercising (see project_sirosid_dcapi_mdoc_cose_bugs and
   # project_siros_verifier_cli_deviceauth_bug) - kept as local overrides for
   # the same reason as walletBackend above, same release-process caveat.
-  issuerRegistry: "ghcr.io/sirosfoundation/vc/registry:0.7.0-sirosid.0"
-  issuerApigw: "ghcr.io/sirosfoundation/vc/apigw:0.7.0-sirosid.0"
-  issuerCore: "ghcr.io/sirosfoundation/vc/issuer:0.7.0-sirosid.0"
-  verifier: "ghcr.io/sirosfoundation/vc/verifier:0.7.0-sirosid.0"
+  issuerRegistry: "ghcr.io/sirosfoundation/vc/registry:0.7.0-sirosid.1"
+  issuerApigw: "ghcr.io/sirosfoundation/vc/apigw:0.7.0-sirosid.1"
+  issuerCore: "ghcr.io/sirosfoundation/vc/issuer:0.7.0-sirosid.1"
+  verifier: "ghcr.io/sirosfoundation/vc/verifier:0.7.0-sirosid.1"
+
+  # siros-id-stack's own images.walletFrontendConfig pin is 110 commits behind
+  # release/sirosid HEAD - confirmed live against gdc: that old build predates
+  # src/lib/auth/tokens/AuthTokens.ts entirely (the backend/anonymous
+  # token-kind split), so it can't speak the audience/TAC claims
+  # go-wallet-backend's go-tokenauth enforcement (PR #264-era, see
+  # walletBackend above) now requires - every authenticated call
+  # (/issuer/all, /user/session/private-data, /user/session/account-info)
+  # 403ed with "Token audience not permitted for this endpoint", confirmed via
+  # wallet-proxy's access log response size. Pinned to an immutable
+  # unstable-<sha> tag (release/sirosid's CI publishes one per push) rather
+  # than the floating "unstable" tag, matching how the other pins here are
+  # fixed, reproducible references.
+  #
+  # DELETE this override once siros-id-stack bumps images.walletFrontendConfig
+  # past this release.
+  # unstable-455c2ca -> 0.5.0-1-sirosid.10 (26 commits): most relevantly this
+  # carries wallet-frontend#220, which stops a verifier-initiated
+  # presentation crashing with "Cannot read properties of null (reading
+  # 'filter')" - vcEntityList is null until the credential engine's first
+  # load, and a request arriving on the callback route can beat it. Now a
+  # release tag rather than an unstable-<sha> build: same reproducibility,
+  # reviewable release. GHCR drops the git tag's "v" prefix, so
+  # v0.5.0-1-sirosid.10 publishes as 0.5.0-1-sirosid.10.
+  walletFrontendConfig: "ghcr.io/sirosfoundation/wallet-frontend:0.5.0-1-sirosid.10"
+
+  # mini-oidc is NOT part of the siros-id-stack chart (it's a sirosid-dev
+  # testing-only component), so unlike every pin above it isn't consumed via
+  # `helm template` - scripts/fly_common.py reads this key directly. It lives
+  # here anyway so that all Fly image pins have exactly one home; a pin buried
+  # in a Python literal is the one nobody remembers to bump.
+  #
+  # Unlike every other pin in this file, this one is NOT Fly-only: the local
+  # docker-compose stack reads it too (the Makefile's MINI_OIDC_VERSION, which
+  # docker-compose.vc-services.yml requires). mini-oidc is the one local-stack
+  # image pulled from a registry rather than built from a sibling checkout, and
+  # it used to float on `:main` locally - so two developers on the same commit
+  # could run months-apart builds with no visible sign of it. Bumping this key
+  # now moves local and Fly together; that is deliberate, not a leak of scope.
+  #
+  # 0.0.2 -> 0.0.3: adds the "ehic" scope. vc's apigw maps ehic to its
+  # assertion (OIDC-backed) data source and requests the credential type as
+  # the OIDC scope, so without this mini-oidc rejects the request and EHIC
+  # cannot be issued at all.
+  #
+  # 0.0.3 -> 0.0.4: adds handlers for the "pid", "pid_1_5" and "pid_1_8"
+  # scopes (mini-oidc#22). All three were advertised in scopes_supported with
+  # nothing behind them, so a request naming one fell through to a
+  # backwards-compat path releasing only given_name/family_name/name/email -
+  # no birthdate, nationality, place of birth or issuing authority, i.e. not
+  # enough to build a PID from. Dormant while apigw asks for "openid profile",
+  # live the moment it asks for the credential type as the scope.
+  #
+  # 0.0.4 -> 0.0.5: data-driven attestation scopes (mini-oidc#27) - any
+  # `attestations:` block in users.yaml is released verbatim under the scope
+  # named by its key - shipping EU Business Wallet data (EBW-OID, EUCC, EU
+  # PoA) for the company users. values-base.yaml's ebw_oid/eucc/eu_poa
+  # credential types are assertion-sourced against exactly those scopes, so
+  # an older mini-oidc has nothing to release for them and issuance fails.
+  miniOidc: "ghcr.io/sirosfoundation/mini-oidc:0.0.5"
+
+  # env-admin is sirosid-dev's OWN code (env-admin/), the privileged actor
+  # behind the dashboard's "Clear all data" / `make fly-storage-clear`.
+  # Published to GHCR by .github/workflows/env-admin-image.yml on a git tag
+  # `env-admin-v<version>` (the version is env-admin/server.py's VERSION).
+  # Not in the siros-id-stack chart, so pinned here like miniOidc above.
+  # Until the tag has been pushed - or when testing an env-admin change -
+  # fly-up notices the pin is not pullable and builds env-admin/Dockerfile
+  # locally into the app's registry.fly.io namespace instead.
+  envAdmin: "ghcr.io/sirosfoundation/sirosid-env-admin:0.1.1"

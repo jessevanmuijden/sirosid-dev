@@ -6,6 +6,7 @@
 #   make up               # Start default stack (go-trust allow-all PDP)
 #   make up VC=1           # Add production-like VC services
 #   make up PDP=deny       # Use deny-all PDP for negative testing
+#   make up AS_RULES=baseline  # Test against the real AS SPOCP policy
 #   make status            # Check service health
 #   make down              # Stop all services
 
@@ -16,28 +17,33 @@ _truthy = $(filter 1 yes on up,$(1))
 WALLET_NAME ?= SIROS ID (dev)
 
 .PHONY: help setup up down logs status status-vc \
-        ensure-conformance-hosts fetch-golden-env \
+        ensure-conformance-hosts ensure-local-hosts fetch-golden-env \
         register-mocks register-vc-services clean show-branches show-images build-info pki \
-        render-helm-config fly-up fly-down fly-status \
+        bbs-keys \
+        render-helm-config vc-config-parity fly-up fly-down fly-stop fly-start fly-status \
+        plan _print-compose-files storage-status storage-clear fly-storage-clear boot \
+        datastore-token datastore-search datastore-upload \
 	android-setup android-config android-up android-down android-full android-restart android-launch android-logs android-test \
 	usb-android-setup usb-android-config usb-android-up usb-android-down usb-android-full usb-android-restart usb-android-launch usb-android-logs usb-android-status usb-android-test \
 	usb-android-test-wsca \
 	usb-android-conformance publish-conformance-results \
-	install tunnel tunnel-stop tunnel-status restart-with-tunnels ensure-tunnels
+	tunnel tunnel-stop tunnel-status restart-with-tunnels ensure-tunnels
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-# GitHub org
-GITHUB_ORG ?= git@github.com:sirosfoundation
+# GitHub org - https, not ssh: works in CI (no ssh creds/agent there) as well
+# as local dev, for cloning these public sibling repos with zero auth.
+# Override to an ssh remote if you need push access to a sibling clone.
+GITHUB_ORG ?= https://github.com/sirosfoundation
 
 # Workspace paths - defaults assume sibling directories
 FRONTEND_PATH ?= ../wallet-frontend
 BACKEND_PATH ?= ../go-wallet-backend
 FACETEC_PATH ?= ../facetec-api
 GO_TRUST_PATH ?= ../go-trust
-HELM_CHARTS_PATH ?= ../helm-charts
+CHART_PATH ?= chart
 
 # Docker compose files
 PRIMARY_COMPOSE := docker-compose.test.yml
@@ -46,7 +52,9 @@ GO_TRUST_ALLOW_COMPOSE := docker-compose.go-trust-allow.yml
 GO_TRUST_WHITELIST_COMPOSE := docker-compose.go-trust-whitelist.yml
 GO_TRUST_DENY_COMPOSE := docker-compose.go-trust-deny.yml
 HELM_CONFIG_COMPOSE := docker-compose.helm-config.yml
+AS_RULES_BASELINE_COMPOSE := docker-compose.as-rules-baseline.yml
 VC_SERVICES_COMPOSE := docker-compose.vc-services.yml
+MONGODB_COMPOSE := docker-compose.mongodb.yml
 VC_GO_TRUST_COMPOSE := docker-compose.vc-go-trust.yml
 CONFORMANCE_COMPOSE := docker-compose.conformance.yml
 HTTP_TRANSPORT_COMPOSE := docker-compose.http-transport.yml
@@ -54,14 +62,43 @@ WMP_TRANSPORT_COMPOSE := docker-compose.wmp-transport.yml
 R2PS_COMPOSE := docker-compose.r2ps.yml
 DOMAIN_COMPOSE := docker-compose.domain.yml
 TUNNEL_COMPOSE := docker-compose.tunnel.yml
-TUNNEL_VC_COMPOSE := docker-compose.tunnel-vc.yml
 FACETEC_COMPOSE := docker-compose.facetec.yml
 GOLDEN_COMPOSE := docker-compose.golden.yml
 GOLDEN_GO_TRUST_COMPOSE := docker-compose.golden-go-trust.yml
 GOLDEN_VC_COMPOSE := docker-compose.golden-vc.yml
 
 # Stack options (override on command line)
+# Credential type metadata source.
+#
+#   vendored  (default, today) - each scope resolves its VCTM/MDDL from a
+#             document in fixtures/vc-metadata, rendered into the chart's
+#             vctms ConfigMap and mounted into vc-issuer/vc-apigw/vc-verifier.
+#   external  - scopes resolve by identifier (vct for sd-jwt, doctype for
+#             mso_mdoc) from a TS11 registry instead, and wallet-backend's own
+#             VCTM registry reads the same list. Nothing is vendored.
+#
+# Opt-in while both paths are supported; the intent is to invert this once
+# external is the proven default. Honored identically by `make up` and
+# `make fly-up`.
+REGISTRY ?= vendored
+
+# Ordered, comma-separated list of TS11 registries. Later entries override
+# earlier ones for the same vct/doctype, which is how a deployment-local
+# registry extends or overrides a shared upstream one. Mirrors within a single
+# registry are raced (first hit wins); distinct registries are not.
+CREDENTIAL_REGISTRIES ?= https://registry.siros.org
+
+_REGISTRY_EXTERNAL := $(filter external,$(REGISTRY))
+ifeq ($(REGISTRY),vendored)
+  _REGISTRY_LABEL := vendored (fixtures/vc-metadata)
+else ifeq ($(REGISTRY),external)
+  _REGISTRY_LABEL := external ($(CREDENTIAL_REGISTRIES))
+else
+  $(error Unknown REGISTRY mode '$(REGISTRY)'. Use: vendored, external)
+endif
+
 PDP ?= allow
+AS_RULES ?= allow-all
 VC ?=
 TRANSPORT ?=
 CONFORMANCE ?=
@@ -71,6 +108,30 @@ TUNNELS ?=
 GOLDEN ?=
 REBUILD ?=
 FACETEC ?=
+# W3C Digital Credentials API on the verifier. Off by default: the verifier's
+# UI only attempts navigator.credentials.get() when this is on, and the
+# browser can only answer that if something is registered as a credential
+# provider - i.e. wallet-companion is installed. On a plain browser setup
+# that's a dead end reached before the QR/redirect path is offered, so it
+# only makes sense to opt in.
+DC_API ?= no
+
+# environments/<name>.yaml may carry a `local:` block with defaults for the
+# options above (see scripts/stack.py). Applied here as plain assignments,
+# which is exactly the precedence wanted: a make variable given on the
+# command line can never be overridden by a makefile assignment, so
+# `make up ENV=alice PDP=deny` still wins over the file's pdp: helm.
+ifneq ($(ENV),)
+  # stack.py is silent for a missing file or one without a local: block, and
+  # prints a one-line diagnostic + exits 1 for an invalid key - so stderr is
+  # left alone (a redirect would turn "your defaults were ignored" into a
+  # silent no-op) and a rejected file stops the build here.
+  _ENV_LOCAL_DEFAULTS := $(shell python3 scripts/stack.py make-args --env "$(ENV)" --file-only)
+  ifneq ($(.SHELLSTATUS),0)
+    $(error environments/$(ENV).yaml has an invalid local: block (see above))
+  endif
+  $(foreach kv,$(_ENV_LOCAL_DEFAULTS),$(eval $(kv)))
+endif
 
 # Golden release configuration
 GOLDEN_RELEASES_URL := https://raw.githubusercontent.com/sirosfoundation/siros-conformance/main/golden-releases.yaml
@@ -102,11 +163,118 @@ export VC_REGISTRY_URL ?= http://$(_HOST):9004
 # VC Services URLs (internal, for container-to-container registration)
 VC_APIGW_INTERNAL_URL ?= http://vc-apigw:8080
 VC_VERIFIER_INTERNAL_URL ?= http://vc-verifier:8080
+
+# vc-apigw's public identity for plain `make up VC=yes` (no TUNNELS/CONFORMANCE).
+#
+# vc's apigw derives EVERY endpoint it advertises - credential_issuer,
+# authorization_endpoint, token_endpoint, credential_endpoint, jwks_uri, PAR -
+# from one config value (APIGW.PublicURL; see vc/internal/apigw/apiv1/client.go
+# and vc/pkg/oauth2/metadata_generator.go). There's no separate knob for the
+# browser-facing authorization_endpoint, so that single value has to be
+# reachable BOTH from inside the compose network (wallet-backend resolving
+# issuer metadata, exchanging the token, fetching the credential) AND from the
+# host browser (the OAuth /authorize redirect is a real browser navigation).
+#
+# "vc-apigw:8080" only satisfies the first (browser: DNS failure) and
+# "localhost:9003" only the second (containers: localhost is the container
+# itself). The Docker bridge gateway + vc-apigw's published port satisfies
+# both, since the gateway address is the host and 9003 is bound on 0.0.0.0 -
+# the same trick fixtures/wallet-proxy.conf already documents for reaching the
+# issuer from a physical Android device. TUNNELS=yes/CONFORMANCE=yes don't use
+# this: each supplies its own genuinely public identity (tunnel URL, vc-proxy).
+#
+# The address is a *.localhost name carried by a docker network alias, NOT the
+# bridge-gateway IP an earlier version of this used. Routing the browser hop
+# through a host-published port made correctness depend on the daemon's default
+# publish address: a host with `"ip": "127.0.0.1"` in daemon.json binds
+# 9003 on loopback only, so a container dialling <gateway>:9003 gets an instant
+# "connection refused" while the host's own curl succeeds - confirmed live on a
+# second dev machine. The alias avoids the host round-trip entirely:
+#   - containers: docker's embedded DNS resolves the alias to apigw's container
+#     IP, so nothing traverses a published port and the daemon's bind address
+#     is irrelevant.
+#   - host browser: *.localhost resolves to 127.0.0.1 (RFC 6761) and hits the
+#     published port. `ensure-local-hosts` below adds an /etc/hosts entry on the
+#     machines whose resolver doesn't do this on its own (glibc getaddrinfo
+#     doesn't; Chrome/Firefox/systemd-resolved do).
+# This is why apigw's published and in-container ports must be the same number
+# (9003:9003, with api_server.addr repointed in the generated config): one URL
+# carries one port, and both sides have to be able to use it.
+VC_APIGW_PORT ?= 9003
+VC_APIGW_PUBLIC_URL ?= http://vc-apigw.localhost:$(VC_APIGW_PORT)
+
+# vc-verifier needs the identical treatment, for the identical reason: an
+# OpenID4VP presentation redirect sends the BROWSER to the verifier, while
+# wallet-backend reaches it over the compose network. The base config splits
+# these the wrong way round - verifier.public_url is "http://localhost:9001"
+# (browser-only) while register-vc-services registers "http://vc-verifier:8080"
+# (container-only) - so whichever one a given hop used, the other was broken.
+# Must track wallet-frontend's BASE_PATH (docker-compose.test.yml): the wallet's
+# routes, including the cb route the verifier links to, live under it.
+WALLET_BASE_PATH ?= /id/default/
+
+VC_VERIFIER_PORT ?= 9001
+VC_VERIFIER_PUBLIC_URL ?= http://vc-verifier.localhost:$(VC_VERIFIER_PORT)
+
+# mini-oidc (the IdP behind apigw's auth_providers.oidc, i.e. every
+# authorization_code scope: pid/pid_1_5/pid_1_8/ehic/diploma) needs the same
+# dual-reachable treatment for the same reason: the browser is redirected to
+# its /authorize page, while vc-apigw does OIDC discovery against it
+# server-side - and the issuer it advertises in its discovery document must
+# equal the issuer_url apigw was configured with, or the flow fails issuer
+# validation. Its compose default (http://mini-oidc:9005) is container-only.
+# docker-compose.android*.yml still override ISSUER on the service itself for
+# Waydroid, so those paths are unaffected. Same *.localhost alias mechanism as
+# VC_APIGW_PUBLIC_URL above; mini-oidc already publishes 9005:9005 and 9006:9006,
+# so its ports are aligned as-is and only the alias is needed.
+export MINI_OIDC_ISSUER ?= http://mini-oidc.localhost:9005
+export MINI_OIDC_RP_URL ?= http://mini-oidc-rp.localhost:9006
+
+# mini-oidc is the ONLY local-stack image pulled from a registry rather than
+# built from a sibling checkout, so it's the only one that can silently differ
+# between two developers sitting on the same sirosid-dev commit: its compose
+# default was an unpinned `:main`, and Docker never re-pulls a floating tag it
+# has already cached. Two machines whose last pull happened months apart then
+# run different binaries with no visible sign of it - which is exactly how a
+# credential type that issues fine on one box fails at /credential on another.
+#
+# The pin is read out of values-fly.yaml rather than duplicated here, so the
+# local stack and every Fly environment always run the identical build. That
+# file already exists to be the single home for image pins (see its
+# images.miniOidc comment); a second copy in this Makefile would just be the
+# next thing to drift.
+_MINI_OIDC_PIN := $(shell sed -n 's/^[[:space:]]*miniOidc:.*:\(.*\)".*/\1/p' values-fly.yaml 2>/dev/null)
+export MINI_OIDC_VERSION ?= $(_MINI_OIDC_PIN)
 export GO_TRUST_ALLOW_URL ?= http://$(_HOST):9095
 export GO_TRUST_WHITELIST_URL ?= http://$(_HOST):9096
 export GO_TRUST_DENY_URL ?= http://$(_HOST):9097
 
 export ADMIN_TOKEN ?= e2e-test-admin-token-for-testing-purposes-only
+# PDP=helm mounts a generated secret (fixtures/rendered-secrets/adminToken,
+# render-helm-config.py's gen_secret) into wallet-backend instead of the fixed
+# value above - so anything talking to the admin API on the developer's
+# behalf (register-vc-services, env-admin) has to use that one in helm mode.
+ifeq ($(PDP),helm)
+  _EFFECTIVE_ADMIN_TOKEN = $(shell cat fixtures/rendered-secrets/adminToken 2>/dev/null || echo "$(ADMIN_TOKEN)")
+else
+  _EFFECTIVE_ADMIN_TOKEN = $(ADMIN_TOKEN)
+endif
+export ENV_ADMIN_TOKEN = $(_EFFECTIVE_ADMIN_TOKEN)
+export ENV_ADMIN_ENV_NAME = $(if $(ENV),$(ENV),local)
+# generate-build-info.py embeds this in build-info.json so the dashboard's
+# "Clear all data" button can skip the token prompt. build-info.json is served
+# by the frontend's nginx, which under TUNNELS=yes or DOMAIN=... is reachable
+# from outside this machine - and /_admin/ is proxied right next to it, so
+# the embedded token would let anyone holding the URL wipe the environment.
+# Only hand the token over when the stack is loopback-only.
+ifeq ($(call _truthy,$(TUNNELS))$(DOMAIN),)
+  export BUILD_INFO_ADMIN_TOKEN = $(_EFFECTIVE_ADMIN_TOKEN)
+endif
+# What env-admin re-registers with wallet-backend after a storage reset -
+# the same identities register-vc-services uses (TUNNELS=yes swaps in the
+# tunnel URLs inside `up`, where .env.tunnel is sourced).
+export ENV_ADMIN_ISSUER_URL ?= $(VC_APIGW_PUBLIC_URL)
+export ENV_ADMIN_VERIFIER_URL ?= $(VC_VERIFIER_PUBLIC_URL)
 
 # Colors for output
 GREEN := \033[0;32m
@@ -134,13 +302,30 @@ else ifeq ($(PDP),deny)
 else ifeq ($(PDP),mock)
   _PDP_LABEL := mock-trust-pdp
 else ifeq ($(PDP),helm)
-  # wallet-backend + PDP config rendered from helm-charts/siros-id-stack
+  # wallet-backend + PDP config rendered from this repo's chart/
   # (see scripts/render-helm-config.py) instead of hand-maintained env vars /
   # CLI flags. Transitional/opt-in step towards removing the latter entirely.
   COMPOSE_FILES += -f $(HELM_CONFIG_COMPOSE)
   _PDP_LABEL := go-trust (helm-rendered config)
 else
   $(error Unknown PDP mode '$(PDP)'. Use: allow, whitelist, deny, mock, helm)
+endif
+
+# AS (Authorization Server) SPOCP rules. Default is allow-all
+# (fixtures/as-rules/allow-all.rules) - `make up`'s job is to give every
+# other feature a working AS out of the box, not to exercise the AS
+# ruleset. AS_RULES=baseline swaps in go-wallet-backend's own real baseline
+# policy (rules/default.rules) instead, for directly testing AS rule
+# behavior - see docker-compose.as-rules-baseline.yml. Appended after the
+# PDP block above so it always applies last, regardless of PDP mode
+# (including PDP=helm's `environment: !override`).
+ifeq ($(AS_RULES),allow-all)
+  _AS_RULES_LABEL := allow-all (fixtures/as-rules) - default
+else ifeq ($(AS_RULES),baseline)
+  COMPOSE_FILES += -f $(AS_RULES_BASELINE_COMPOSE)
+  _AS_RULES_LABEL := go-wallet-backend baseline (rules/default.rules) - AS ruleset testing
+else
+  $(error Unknown AS_RULES mode '$(AS_RULES)'. Use: allow-all, baseline)
 endif
 
 # VC services
@@ -160,6 +345,10 @@ endif
 # facetec-api (FaceTec SDK <-> vc issuer bridge). Requires VC services for
 # credential issuance via vc-apigw, so it implies VC=yes.
 ifneq ($(call _truthy,$(FACETEC)),)
+  # Set VC itself, not just the compose file: `up`'s VC pre-flight (config
+  # render from the chart, gobuild image, PKI) is gated on $(VC), and without
+  # it FACETEC=yes ran the vc services on stale or missing rendered config.
+  VC := yes
   ifeq ($(findstring $(VC_SERVICES_COMPOSE),$(COMPOSE_FILES)),)
     COMPOSE_FILES += -f $(VC_SERVICES_COMPOSE)
     _VC_LABEL := yes (via facetec)
@@ -216,17 +405,13 @@ endif
 # Cloudflare quick tunnels (host-managed, not container-managed)
 ifneq ($(call _truthy,$(TUNNELS)),)
 	COMPOSE_FILES += -f $(TUNNEL_COMPOSE)
-  ifneq ($(call _truthy,$(VC)),)
-	COMPOSE_FILES += -f $(TUNNEL_VC_COMPOSE)
-  endif
 	_TUNNELS_LABEL := yes
-	# When VC services are also in the stack, vc-apigw/vc-issuer need a tunnel-patched
-	# config too — the base fixtures/vc-config.yaml hardcodes "https://vc-proxy:8443"
-	# (only reachable when the separate conformance overlay is active), which would
-	# otherwise end up embedded as an unreachable credential_issuer in every credential
-	# offer. See scripts/generate-tunnel-config.py and the config-regeneration step below.
+	# The vc services need no compose overlay of their own under TUNNELS any
+	# more: render-helm-config reads .env.tunnel and feeds the tunnel hosts to
+	# the chart as `hostnames:`, so every one of them advertises a reachable
+	# URL. The old overlay mounted a pre-patched config onto vc-apigw and
+	# vc-issuer only, which silently left vc-verifier on localhost URLs.
 	ifneq ($(findstring $(VC_SERVICES_COMPOSE),$(COMPOSE_FILES)),)
-		COMPOSE_FILES += -f $(TUNNEL_VC_COMPOSE)
 		_TUNNEL_VC_LABEL := yes
 	else
 		_TUNNEL_VC_LABEL := no
@@ -260,6 +445,27 @@ else
   _GOLDEN_LABEL :=
 endif
 
+# mongodb rides along whenever something needs it: the VC services always,
+# and wallet-backend under PDP=helm (its chart-rendered config points at
+# mongodb://mongodb - before this overlay existed, `make up PDP=helm` without
+# VC=yes pointed it at a host that was never started). Its data lives on the
+# named volume sirosid-mongodb-data, which `make down` keeps and `make clean`
+# / `make storage-clear` remove. scripts/stack.py mirrors this rule and
+# tests/test_stack_parity.py keeps the two in step.
+ifneq ($(findstring $(VC_SERVICES_COMPOSE),$(COMPOSE_FILES))$(filter helm,$(PDP)),)
+  COMPOSE_FILES += -f $(MONGODB_COMPOSE)
+endif
+
+# Used by tests/test_stack_parity.py to compare the list above with
+# scripts/stack.py's - the first step towards the Makefile calling the
+# resolver instead of duplicating it.
+_print-compose-files:
+	@echo "$(COMPOSE_FILES)"
+
+plan: ## Show what `make up` would do with these options (compose files, storage, pre-flight) - takes the same flags as `make up`, plus ENV=<name>
+	@python3 scripts/stack.py plan $(if $(ENV),--env "$(ENV)") \
+		$(foreach v,PDP AS_RULES VC TRANSPORT CONFORMANCE R2PS FACETEC DOMAIN TUNNELS GOLDEN DC_API REBUILD,$(if $($(v)),--set $(v)="$($(v))"))
+
 # =============================================================================
 # Help
 # =============================================================================
@@ -268,18 +474,37 @@ help: ## Show this help
 	@echo "$(GREEN)sirosid-dev$(NC) — Local Development Environment"
 	@echo ""
 	@echo "$(GREEN)Primary Targets:$(NC)"
-	@echo "  make setup                           Clone sibling repos"
-	@echo "  make install                         Show dependency/install notes"
+	@echo "  make setup                           Bootstrap: clone sibling repos, install + launch the boot manager"
+	@echo "  make boot                          Launch the boot manager (after make setup)"
+	@echo "  make plan [STACK OPTIONS]            Show what 'make up' would do: compose files, storage, pre-flight"
 	@echo "  make up [STACK OPTIONS]              Start the stack with selected overlays"
 	@echo "  make down                            Stop stack containers"
 	@echo "  make status                          Check core service health"
 	@echo "  make logs                            View Docker logs"
 	@echo "  make clean                           Remove containers, volumes, build cache"
 	@echo ""
+	@echo "$(GREEN)Storage Targets:$(NC)  (Mongo data survives 'make down' on the named volume sirosid-mongodb-data)"
+	@echo "  make storage-status [ENV=<name>]     Show every store: mode, size, whether it persists"
+	@echo "  make storage-clear [ENV=<name>]      Wipe the local stack's data (via env-admin if up, else the volumes) and re-register issuer/verifier"
+	@echo "  make fly-storage-clear ENV=<name>    Same for a Fly environment (via its env-admin app)"
+	@echo "  make fly-down ENV=<name> KEEP_DATA=yes  Tear down but keep the Mongo apps + volumes for the next fly-up"
+	@echo "  make datastore-search [SCOPE=<scope>] [ENV=<name>]  List vc-apigw's datastore documents (authenticated admin API)"
+	@echo "  make datastore-upload FILE=fixtures/vc-bootstrapping/<scope>.json [ENV=<name>]  Add documents to a live environment without a wipe"
+	@echo "  make datastore-sync [DRY_RUN=yes] [SCOPE=<scope>] [ENV=<name>]  Make a live environment's documents and identity mappings match the fixtures"
+	@echo "  make datastore-offer SCOPE=<scope> [DOCUMENT_ID=<id>] [QR=yes] [ENV=<name>]  Pre-authorized credential offer for issuing to a wallet on another device"
+	@echo "  make datastore-token [ENV=<name>]    Print a short-lived Bearer token for vc-apigw's /api/v1"
+	@echo ""
 	@echo "$(GREEN)Fly.io Targets:$(NC)  (named, shareable environments - see Fly.io Options below)"
 	@echo "  make fly-up ENV=<name> [OPTIONS]     Deploy a named Fly.io environment"
 	@echo "  make fly-status ENV=<name>           Show Fly app status for a named environment"
 	@echo "  make fly-down ENV=<name>             Tear down a named Fly.io environment"
+	@echo "  make fly-stop ENV=<name> [ORG=<org>]   Stop every machine, keep the apps and data (scale to zero, as a unit)"
+	@echo "  make fly-start ENV=<name> [ORG=<org>]  Start a stopped environment in deploy order, waiting for health"
+	@echo "  make env-show ENV=<name>             Print a named environment's persisted config (environments/<name>.yaml)"
+	@echo ""
+	@echo "$(GREEN)Config Chart Targets:$(NC)  (chart/ is this repo's own chart - see chart/README.md)"
+	@echo "  make render-helm-config [ENV=<name>] Render wallet-backend/PDP/vc-services config from chart/ into fixtures/rendered/"
+	@echo "  make vc-config-parity                Render chart/ for compose + fly-gdc and diff against fixtures/vc-config-golden (PARITY_ARGS=--update re-seeds)"
 	@echo ""
 	@echo "$(GREEN)Tunnel Targets:$(NC)"
 	@echo "  make tunnel-status                   Show active tunnel URLs and host processes"
@@ -316,12 +541,35 @@ help: ## Show this help
 	@echo ""
 	@echo "$(GREEN)Stack Options:$(NC)  (pass on the make command line to 'make up')"
 	@echo ""
+	@echo "  $(YELLOW)ENV=$(NC)<name>          Layer environments/<name>.yaml: its 'local:' block supplies"
+	@echo "                     defaults for every option below (flags on the command line win),"
+	@echo "                     its trust/values config reaches the rendered chart config."
+	@echo ""
 	@echo "  $(YELLOW)PDP=$(NC)<allow|whitelist|deny|mock|helm>"
 	@echo "                     Select trust policy provider"
 	@echo "                     default: $(GREEN)allow$(NC)"
-	@echo "                     helm: wallet-backend + PDP config rendered from"
-	@echo "                     helm-charts/siros-id-stack instead of hand-maintained"
-	@echo "                     env vars/flags - requires HELM_CHARTS_PATH (../helm-charts)"
+	@echo "                     helm is also the only mode where wallet-backend gets the persistent"
+	@echo "                     Mongo volume; every other mode is an in-memory store."
+	@echo "                     helm: wallet-backend + PDP config rendered from the"
+	@echo "                     chart/ instead of hand-maintained"
+	@echo "                     env vars/flags - chart at CHART_PATH (default: ./chart)"
+	@echo ""
+	@echo "  $(YELLOW)AS_RULES=$(NC)<allow-all|baseline>"
+	@echo "                     Select the built-in Authorization Server's SPOCP ruleset"
+	@echo "                     default: $(GREEN)allow-all$(NC) (fixtures/as-rules) - unconditionally"
+	@echo "                     permissive, so every other feature gets a working AS for free"
+	@echo "                     baseline: go-wallet-backend's own real policy (rules/default.rules) -"
+	@echo "                     use only when directly testing AS rule behavior"
+	@echo ""
+	@echo "  $(YELLOW)REGISTRY=$(NC)<vendored|external>"
+	@echo "                     Where credential type metadata comes from (also honored by fly-up)"
+	@echo "                     default: $(GREEN)vendored$(NC) - documents in fixtures/vc-metadata"
+	@echo "                     external: vc and wallet-backend both resolve types from"
+	@echo "                     \$$(CREDENTIAL_REGISTRIES) instead - nothing vendored"
+	@echo ""
+	@echo "  $(YELLOW)CREDENTIAL_REGISTRIES=$(NC)<url,...>"
+	@echo "                     Ordered registry list for REGISTRY=external (later overrides earlier)"
+	@echo "                     default: $(GREEN)$(CREDENTIAL_REGISTRIES)$(NC)"
 	@echo ""
 	@echo "  $(YELLOW)VC=$(NC)<yes|no>"
 	@echo "                     Enable production-like VC services"
@@ -365,21 +613,52 @@ help: ## Show this help
 	@echo "$(GREEN)Fly.io Options:$(NC)  (pass on the make command line to 'make fly-up')"
 	@echo ""
 	@echo "  $(YELLOW)ENV=$(NC)<name>            Required. Environment name (sirosid-<name>-*.fly.dev apps)"
+	@echo "                     If environments/<name>.yaml exists, its persisted"
+	@echo "                     images/trusted-issuers/verifiers/etc. are merged in as"
+	@echo "                     defaults automatically - see 'make env-show ENV=<name>'"
+	@echo "                     and environments/README.md. Every option below adds to"
+	@echo "                     (or, for IMAGES=, overrides per-component) that file for"
+	@echo "                     this one run - it does not edit the file."
 	@echo ""
 	@echo "  $(YELLOW)IMAGES=$(NC)<component=ref,...>"
 	@echo "                     Ad-hoc, per-environment image override, e.g. your own"
-	@echo "                     branch build - never touches any checked-in file"
+	@echo "                     branch build - a one-off run only unless also saved to"
+	@echo "                     environments/<name>.yaml"
 	@echo ""
 	@echo "  $(YELLOW)CONFORMANCE=$(NC)<yes|no>"
 	@echo "                     Also deploy the OpenID conformance suite (3 extra apps)"
 	@echo ""
 	@echo "  $(YELLOW)TRUSTED_ISSUERS=$(NC)<url,...>"
 	@echo "                     Ad-hoc external issuers for interop testing - added to"
-	@echo "                     pid_issuers only, there is no TRUSTED_VERIFIERS equivalent"
+	@echo "                     pid_issuers only"
+	@echo ""
+	@echo "  $(YELLOW)TRUSTED_VERIFIERS=$(NC)<identity,...>"
+	@echo "                     Ad-hoc external verifiers for interop testing (e.g. a"
+	@echo "                     DC API conformance site) - added to verifiers only. Must"
+	@echo "                     be the exact post-normalization Subject.ID string (see"
+	@echo "                     scripts/fly-up.py --help for the x509_hash/x509_san_dns"
+	@echo "                     normalization gotcha)"
+	@echo ""
+	@echo "  $(YELLOW)TRUSTED_VERIFIER_ROOTS=$(NC)<path,...>"
+	@echo "                     Path(s) to PEM CA cert(s) to merge into PDP's system CA"
+	@echo "                     pool (go-trust's additional_trusted_roots) - for a"
+	@echo "                     verifier whose request-signing cert is issued by a"
+	@echo "                     self-signed 'reader CA' root meant to be trusted"
+	@echo "                     out-of-band (e.g. verifier.multipaz.org)"
 	@echo ""
 	@echo "  $(YELLOW)WALLET_ATTESTATION=$(NC)<yes|no>"
 	@echo "                     Enable wallet-provider Key Attestation"
 	@echo "                     default: $(GREEN)yes$(NC)"
+	@echo ""
+	@echo "  $(YELLOW)RICAL_PROVIDER_URL=$(NC)<url> $(YELLOW)RICAL_ROOT_CERT=$(NC)<path>"
+	@echo "                     Registers PDP's mdocrical registry (ISO 18013-5 2nd ed."
+	@echo "                     Annex F reader-trust) for BLE/NFC proximity presentation -"
+	@echo "                     must both be set together. See fixtures/trusted-roots/README.md"
+	@echo ""
+	@echo "  $(YELLOW)DC_API_ENABLE=$(NC)<true|false>"
+	@echo "                     Override verifier.digital_credentials.enable (W3C DC API"
+	@echo "                     support) for this environment only - default (unset) leaves"
+	@echo "                     fixtures/vc-config.yaml's own value (true) untouched"
 	@echo ""
 	@echo "  $(YELLOW)ANDROID_APPS=$(NC)<pkg=fingerprint,...>"
 	@echo "                     Same option as 'make up' - see Stack Options above"
@@ -419,7 +698,7 @@ help: ## Show this help
 	@echo "  $(YELLOW)VC_PATH=$(NC)          vc services source     (default: $(GREEN)../vc$(NC))"
 	@echo "  $(YELLOW)GO_TRUST_PATH=$(NC)    go-trust source        (default: $(GREEN)../go-trust$(NC))"
 	@echo "  $(YELLOW)FACETEC_PATH=$(NC)     facetec-api source     (default: $(GREEN)../facetec-api$(NC))"
-	@echo "  $(YELLOW)HELM_CHARTS_PATH=$(NC) helm-charts source      (default: $(GREEN)../helm-charts$(NC)) - PDP=helm only"
+	@echo "  $(YELLOW)CHART_PATH=$(NC) config chart (default: $(GREEN)chart$(NC), in this repo) - PDP=helm only"
 	@echo ""
 	@echo "$(GREEN)Other Variables:$(NC)"
 	@echo ""
@@ -472,30 +751,7 @@ show-images:
 
 # Generate build-info.json with git metadata from each component repo
 build-info:
-	@echo '{ "components": [' > build-info.json
-	@SEP=""; \
-	for repo_info in \
-		"wallet-frontend:$(FRONTEND_PATH)" \
-		"go-wallet-backend:$(BACKEND_PATH)" \
-		"facetec-api:$(FACETEC_PATH)" \
-		"sirosid-dev:."; \
-	do \
-		name=$${repo_info%%:*}; \
-		path=$${repo_info#*:}; \
-		if [ -d "$$path/.git" ]; then \
-			branch=$$(git -C "$$path" branch --show-current 2>/dev/null || echo "unknown"); \
-			commit=$$(git -C "$$path" rev-parse HEAD 2>/dev/null || echo "unknown"); \
-			built=$$(git -C "$$path" log -1 --format='%ci' 2>/dev/null || echo "unknown"); \
-			dirty="false"; \
-			if ! git -C "$$path" diff --quiet HEAD 2>/dev/null; then dirty="true"; fi; \
-			printf '%s\n    { "name": "%s", "branch": "%s", "commit": "%s", "built": "%s", "dirty": %s }' \
-				"$$SEP" "$$name" "$$branch" "$$commit" "$$built" "$$dirty" >> build-info.json; \
-			SEP=","; \
-		fi; \
-	done
-	@echo '' >> build-info.json
-	@echo '  ], "generated": "'$$(date -Iseconds)'" }' >> build-info.json
-	@echo "$(GREEN)Generated build-info.json$(NC)"
+	@python3 scripts/generate-build-info.py
 
 # =============================================================================
 # Up / Down / Status
@@ -503,11 +759,25 @@ build-info:
 
 CONFORMANCE_HOSTNAME := localhost.emobix.co.uk
 
-up: ## Start the stack (use PDP=, VC=, TRANSPORT=, CONFORMANCE=, GOLDEN= to configure)
+up: ## Start the stack (use PDP=, VC=, TRANSPORT=, CONFORMANCE=, GOLDEN=, AS_RULES= to configure)
 	@# Ensure .well-known/assetlinks.json exists (Docker bind mount requires it)
 	@mkdir -p .well-known && [ -f .well-known/assetlinks.json ] || echo '[]' > .well-known/assetlinks.json
 	@# Ensure the shared e2e-test-network exists
 	@docker network inspect e2e-test-network >/dev/null 2>&1 || docker network create e2e-test-network
+	@# Render the go-trust whitelist. Generated (not mounted straight from the
+	@# checked-in fixture) purely because PDP=whitelist has to trust vc-apigw
+	@# under the same bridge-gateway identity it advertises as its
+	@# credential_issuer - see VC_APIGW_PUBLIC_URL above. Everything else comes
+	@# verbatim from fixtures/go-trust-whitelist.txt, which stays the source of
+	@# truth. Unconditional: docker-compose.go-trust.yml mounts this file in
+	@# every PDP mode, not just PDP=whitelist.
+	@python3 -c "import json,sys; \
+p='fixtures/go-trust-whitelist.txt'; w=json.load(open(p)); \
+u='$(VC_APIGW_PUBLIC_URL)'; \
+w['issuers']=w['issuers']+[u] if u and u not in w['issuers'] else w['issuers']; \
+v='$(VC_VERIFIER_PUBLIC_URL)'; \
+w['verifiers']=w['verifiers']+[v] if v and v not in w['verifiers'] else w['verifiers']; \
+json.dump(w, open('fixtures/go-trust-whitelist-local.json','w'), indent=2)"
 ifneq ($(call _truthy,$(TUNNELS)),)
 	@if [ -n "$(DOMAIN)" ]; then \
 		echo "$(RED)Error: TUNNELS=yes cannot be combined with DOMAIN=$(DOMAIN).$(NC)"; \
@@ -515,15 +785,19 @@ ifneq ($(call _truthy,$(TUNNELS)),)
 		exit 1; \
 	fi
 	@$(MAKE) --no-print-directory ensure-tunnels
-ifneq ($(findstring $(VC_SERVICES_COMPOSE),$(COMPOSE_FILES)),)
-	@# Regenerate the tunnel-patched vc-config now that .env.tunnel is populated
-	@# (either just now, or reused from an already-running tunnel session).
-	@. ./.env.tunnel && python3 scripts/generate-tunnel-config.py \
-		--apigw-url "$$TUNNEL_VC_APIGW_URL" \
-		--frontend-url "$$TUNNEL_FRONTEND_URL"
-endif
 endif
 ifneq ($(call _truthy,$(VC)),)
+	@$(MAKE) --no-print-directory ensure-local-hosts
+	@# Pre-flight: an empty pin would resolve to the image ref "mini-oidc:",
+	@# which docker rejects with a confusing parse error rather than pointing
+	@# at values-fly.yaml. Only reachable if that file was edited into a shape
+	@# the extraction in this Makefile no longer matches.
+	@if [ -z "$(MINI_OIDC_VERSION)" ]; then \
+		echo "$(RED)Error: could not read images.miniOidc from values-fly.yaml$(NC)"; \
+		echo "  Expected a line like: miniOidc: \"ghcr.io/sirosfoundation/mini-oidc:0.0.3\""; \
+		echo "  Override for a one-off with: make up VC=yes MINI_OIDC_VERSION=<tag>"; \
+		exit 1; \
+	fi
 	@# Pre-flight: ../vc must exist for VC service builds
 	@if [ ! -d "$(VC_PATH:-../vc)" ] && [ ! -d "../vc" ]; then \
 		echo "$(RED)Error: VC services require the 'vc' repo at ../vc$(NC)"; \
@@ -547,16 +821,18 @@ ifneq ($(call _truthy,$(VC)),)
 		echo "$(YELLOW)Building gobuild base image (ensures Go toolchain matches ../vc/go.mod)...$(NC)"; \
 		docker build --quiet --tag docker.sunet.se/iam_vc/gobuild:local \
 			--file "$$_VC_DIR/dockerfiles/gobuild" "$$_VC_DIR" >/dev/null
+	@# Render every vc service's config from the in-repo chart, the same
+	@# way PDP=helm already renders wallet-backend's and the PDP's. This
+	@# replaced fixtures/vc-config.yaml and the four mechanically-patched
+	@# copies of it (local/tunnel/android/android-usb) that had drifted apart
+	@# in more than hostnames - see values-base.yaml's header.
+	@$(MAKE) --no-print-directory render-helm-config
 endif
 ifeq ($(PDP),helm)
-	@# Pre-flight: $(HELM_CHARTS_PATH)/siros-id-stack must exist to render config from
-	@if [ ! -d "$(HELM_CHARTS_PATH)/siros-id-stack" ]; then \
-		echo "$(RED)Error: PDP=helm requires the 'helm-charts' repo at $(HELM_CHARTS_PATH)$(NC)"; \
-		echo "  Run: make setup   (clones all required sibling repos)"; \
-		echo "  Or:  git clone $(GITHUB_ORG)/helm-charts.git $(HELM_CHARTS_PATH)"; \
-		exit 1; \
-	fi
+	@command -v helm >/dev/null 2>&1 || { echo "$(RED)Error: helm not found - PDP=helm renders config via 'helm template' - https://helm.sh/docs/intro/install/$(NC)"; exit 1; }
+  ifeq ($(call _truthy,$(VC)),)
 	@$(MAKE) --no-print-directory render-helm-config
+  endif
 endif
 ifneq ($(call _truthy,$(FACETEC)),)
 	@# Pre-flight: ../facetec-api must exist for the facetec-api build
@@ -573,6 +849,9 @@ ifneq ($(call _truthy,$(FACETEC)),)
 		echo "  export FACETEC_SERVER_URL=\"https://user:pass@your-facetec-server.example.org\""; \
 		exit 1; \
 	fi
+	@# vc-apigw's datastore API requires an admin JWT (scripts/api_auth.py);
+	@# facetec-api reads a static one from ISSUER_API_KEY_PATH.
+	@python3 scripts/facetec_issuer_token.py
 endif
 ifneq ($(call _truthy,$(CONFORMANCE)),)
 	@$(MAKE) --no-print-directory ensure-conformance-hosts
@@ -582,6 +861,7 @@ ifneq ($(GOLDEN),)
 endif
 	@echo "$(GREEN)Starting sirosid-dev...$(NC)"
 	@echo "  PDP:         $(_PDP_LABEL)"
+	@echo "  AS rules:    $(_AS_RULES_LABEL)"
 	@echo "  VC services: $(_VC_LABEL)"
 	@echo "  Transport:   $(_TRANSPORT_LABEL)"
 	@echo "  Conformance: $(_CONFORMANCE_LABEL)"
@@ -589,6 +869,7 @@ endif
 	@echo "  Domain:      $(_DOMAIN_LABEL)"
 	@echo "  Tunnels:     $(_TUNNELS_LABEL)"
 	@echo "  facetec-api: $(_FACETEC_LABEL)"
+	@echo "  DC API:      $(if $(call _truthy,$(DC_API)),enabled,disabled (DC_API=yes to enable; needs wallet-companion))"
 ifneq ($(call _truthy,$(TUNNELS)),)
 	@echo "  vc-config:   $(_TUNNEL_VC_LABEL) (tunnel-patched credential_issuer/token_endpoint/CORS)"
 endif
@@ -611,8 +892,10 @@ ifneq ($(GOLDEN),)
 	set -a && . ./.env.golden && set +a && \
 		{ [ -f .env.tunnel ] && . ./.env.tunnel && export TUNNEL_FRONTEND_URL TUNNEL_BACKEND_URL TUNNEL_ENGINE_URL TUNNEL_RPID TUNNEL_VC_VERIFIER_URL TUNNEL_VC_APIGW_URL || true; } && \
 		{ [ -f .env.android ] && . ./.env.android && export APK_KEY_HASH || true; } && \
+		{ [ -n "$${TUNNEL_VC_APIGW_URL:-}" ] && export ENV_ADMIN_ISSUER_URL="$$TUNNEL_VC_APIGW_URL" || true; } && \
+		{ [ -n "$${TUNNEL_VC_VERIFIER_URL:-}" ] && export ENV_ADMIN_VERIFIER_URL="$$TUNNEL_VC_VERIFIER_URL" || true; } && \
 		{ _ANDROID_ORIGINS=$$(python3 scripts/android_apps.py --rp-origins $(if $(ANDROID_APPS),--android-app "$(ANDROID_APPS)") 2>/dev/null); \
-		  [ -n "$$_ANDROID_ORIGINS" ] && export WALLET_RP_ORIGINS="http://localhost:3000,$$_ANDROID_ORIGINS" || true; } && \
+		  [ -n "$$_ANDROID_ORIGINS" ] && export WALLET_RP_ORIGINS="http://localhost:3000,$$_ANDROID_ORIGINS" WALLET_ANDROID_RP_ORIGINS="$$_ANDROID_ORIGINS" || true; } && \
 	WALLET_NAME="$(WALLET_NAME)" \
 		docker compose $(COMPOSE_FILES) up -d --pull always 2>&1 | \
 		grep -E '^\s*(✔|=>|Pulling|Container|Network|Image)' || true
@@ -627,8 +910,10 @@ endif
 	@_LOG=$$(mktemp /tmp/compose.XXXXXX); \
 	[ -f .env.tunnel ] && . ./.env.tunnel && export TUNNEL_FRONTEND_URL TUNNEL_BACKEND_URL TUNNEL_ENGINE_URL TUNNEL_RPID TUNNEL_VC_VERIFIER_URL TUNNEL_VC_APIGW_URL || true; \
 	[ -f .env.android ] && . ./.env.android && export APK_KEY_HASH || true; \
+	[ -n "$${TUNNEL_VC_APIGW_URL:-}" ] && export ENV_ADMIN_ISSUER_URL="$$TUNNEL_VC_APIGW_URL" || true; \
+	[ -n "$${TUNNEL_VC_VERIFIER_URL:-}" ] && export ENV_ADMIN_VERIFIER_URL="$$TUNNEL_VC_VERIFIER_URL" || true; \
 	_ANDROID_ORIGINS=$$(python3 scripts/android_apps.py --rp-origins $(if $(ANDROID_APPS),--android-app "$(ANDROID_APPS)") 2>/dev/null); \
-	[ -n "$$_ANDROID_ORIGINS" ] && export WALLET_RP_ORIGINS="http://localhost:3000,$$_ANDROID_ORIGINS" || true; \
+	[ -n "$$_ANDROID_ORIGINS" ] && export WALLET_RP_ORIGINS="http://localhost:3000,$$_ANDROID_ORIGINS" WALLET_ANDROID_RP_ORIGINS="$$_ANDROID_ORIGINS" || true; \
 	FRONTEND_PATH=$(FRONTEND_PATH) BACKEND_PATH=$(BACKEND_PATH) FACETEC_PATH=$(FACETEC_PATH) \
 		WALLET_NAME="$(WALLET_NAME)" \
 		docker compose $(COMPOSE_FILES) up -d --build >$$_LOG 2>&1; \
@@ -643,6 +928,51 @@ endif
 	fi; \
 	rm -f $$_LOG
 endif
+ifneq ($(call _truthy,$(VC)),)
+	@# vc-apigw/vc-issuer read their whole config from a bind-mounted file that
+	@# this target regenerates on every run (fixtures/rendered/vc-*.yaml, or
+	@# -tunnel.yaml under TUNNELS=yes). `docker compose up -d` only diffs the
+	@# compose *service definition* - never the CONTENT of a mounted file - so
+	@# an otherwise-unchanged spec leaves the old containers running with the
+	@# previous config, silently. That's not cosmetic: a stale vc-apigw keeps
+	@# advertising the previous credential_issuer and keeps retrying OIDC
+	@# discovery against the previous issuer_url ("OIDC RP not ready"), so the
+	@# regenerated config appears to have had no effect at all. Force-recreate
+	@# them so a config change always takes. Deliberately not --no-deps: these
+	@# two have real depends_on ordering (mongodb/vc-registry healthy, then
+	@# vc-issuer healthy, then vc-apigw) that compose should still honor.
+	@echo "$(YELLOW)Applying regenerated vc-config (recreating vc-issuer/vc-apigw)...$(NC)"
+	@_LOG=$$(mktemp /tmp/compose-vc.XXXXXX); \
+	if ! docker compose $(COMPOSE_FILES) up -d --force-recreate vc-issuer vc-apigw vc-verifier >$$_LOG 2>&1; then \
+		echo "$(RED)Failed to recreate vc-issuer/vc-apigw:$(NC)"; \
+		cat $$_LOG; \
+		rm -f $$_LOG; \
+		exit 1; \
+	fi; \
+	rm -f $$_LOG
+endif
+ifneq ($(findstring $(GO_TRUST_COMPOSE),$(COMPOSE_FILES)),)
+	@# Same reason as the vc services above, for the same class of bug: the
+	@# whitelist is regenerated on every `up`, but go-trust parses it ONCE at
+	@# startup into an in-memory registry. A bind mount makes the new file
+	@# visible inside the container immediately, which is exactly what makes
+	@# this so easy to miss - `docker exec ... cat /app/whitelist.txt` shows the
+	@# correct, current content while the running process is still evaluating
+	@# against what it read at boot, and the only symptom is an inexplicable
+	@# "not trusted" for an entity plainly listed in the file.
+	@_LOG=$$(mktemp /tmp/compose-pdp.XXXXXX); \
+	if ! docker compose $(COMPOSE_FILES) up -d --force-recreate go-trust-whitelist >$$_LOG 2>&1; then \
+		echo "$(RED)Failed to recreate go-trust-whitelist:$(NC)"; \
+		cat $$_LOG; \
+		rm -f $$_LOG; \
+		exit 1; \
+	fi; \
+	rm -f $$_LOG
+endif
+	@# Regenerate now that containers are up: the earlier `build-info` call
+	@# (before compose) can only fill in the git side - the image provenance
+	@# section reads the RUNNING containers, so it would be empty at that point.
+	@python3 scripts/generate-build-info.py >/dev/null 2>&1 || true
 	@if [ "$(call _truthy,$(TUNNELS))" != "" ] && [ -f .env.tunnel ]; then \
 		. ./.env.tunnel; \
 		echo ""; \
@@ -730,6 +1060,11 @@ status: ## Check core service health
 		printf "  %-20s $(GREEN)%s$(NC)\n" "vctm-registry" "✓ running" || true
 	@curl -sf $(FACETEC_API_URL)/livez >/dev/null 2>&1 && \
 		printf "  %-20s $(GREEN)%s$(NC)\n" "facetec-api" "✓ running" || true
+	@# env-admin is published on loopback only (docker-compose.test.yml), so
+	@# probe localhost even under DOMAIN=... where _HOST is the domain.
+	@curl -sf http://localhost:3002/health >/dev/null 2>&1 && \
+		printf "  %-20s $(GREEN)%s$(NC)\n" "env-admin" "✓ running" || \
+		printf "  %-20s $(RED)%s$(NC)\n" "env-admin" "✗ not running"
 	@echo ""
 
 status-vc: ## Check VC service health
@@ -764,6 +1099,27 @@ ensure-conformance-hosts: ## Ensure /etc/hosts has the conformance suite entry
 		echo "$(GREEN)✓ Added $(CONFORMANCE_HOSTNAME) to /etc/hosts$(NC)"; \
 	fi
 
+# Hostnames the browser must resolve to loopback for the VC=yes flow (see
+# VC_APIGW_PUBLIC_URL). Only touches /etc/hosts on machines whose resolver
+# doesn't already handle *.localhost per RFC 6761 - Chrome, Firefox and
+# systemd-resolved do, plain glibc getaddrinfo does not - so on most Linux
+# desktops this is a no-op that never asks for sudo.
+LOCAL_HOSTNAMES := vc-apigw.localhost vc-verifier.localhost mini-oidc.localhost mini-oidc-rp.localhost
+
+ensure-local-hosts: ## Ensure *.localhost names used by VC=yes resolve to 127.0.0.1
+	@for h in $(LOCAL_HOSTNAMES); do \
+		if getent hosts "$$h" >/dev/null 2>&1; then \
+			continue; \
+		fi; \
+		if grep -q "[[:space:]]$$h\([[:space:]]\|$$\)" /etc/hosts 2>/dev/null; then \
+			continue; \
+		fi; \
+		echo "$(YELLOW)$$h does not resolve - adding 127.0.0.1 $$h to /etc/hosts (requires sudo)...$(NC)"; \
+		echo "127.0.0.1 $$h" | sudo tee -a /etc/hosts >/dev/null && \
+			echo "  $(GREEN)✓ added $$h$(NC)" || \
+			echo "  $(RED)Could not add $$h - the browser may fail to reach the issuer$(NC)"; \
+	done
+
 # =============================================================================
 # Mock Registration
 # =============================================================================
@@ -779,32 +1135,31 @@ register-mocks: ## Register mock verifier with backend
 		echo "  Mock verifier registered" || \
 		echo "  $(YELLOW)Warning: Could not register mock verifier$(NC)"
 
-register-vc-services: ## Register VC issuer and verifier with backend
+# client_id is required, not cosmetic: without it, wallet-backend's engine
+# defaults to the OID4VCI §7.1 "unregistered client" convention
+# (client_id = redirect_uri), which vc-apigw's static clients map (keyed by
+# name, e.g. "e2e-test-client") never matches - every web-initiated
+# authorization_code credential (any auth_provider: oidc scope) then fails
+# vc-apigw's PAR endpoint with invalid_client. "e2e-test-client" is the same
+# client fixtures/vc-config.yaml's redirect_uri list is kept in sync with
+# (see its own comment) - matches fly-up.py's register_vc_services() (Fly
+# environments hit and fixed the identical bug independently).
+register-vc-services: ## Register VC issuer and verifier with backend (scripts/bootstrap.py - shared with fly-up and env-admin's storage reset)
 	@echo "$(GREEN)Registering VC services with wallet backend...$(NC)"
-	@for i in $$(seq 1 30); do \
-		curl -sf $(ADMIN_URL)/admin/tenants/$(TENANT_ID) \
-			-H "Authorization: Bearer $(ADMIN_TOKEN)" >/dev/null 2>&1 && break; \
-		sleep 2; \
-	done
-	@_VC_APIGW_REG_URL="$(VC_APIGW_INTERNAL_URL)"; \
-	_VC_VERIFIER_REG_URL="$(VC_VERIFIER_INTERNAL_URL)"; \
+	@# The issuer must be registered under the SAME identity vc-apigw puts in
+	@# its own metadata's "credential_issuer" (OpenID4VCI requires the two to
+	@# match): VC_APIGW_PUBLIC_URL for the plain VC=yes path (see its
+	@# definition above), the tunnel URL under TUNNELS=yes.
+	@_VC_APIGW_REG_URL="$(VC_APIGW_PUBLIC_URL)"; \
+	_VC_VERIFIER_REG_URL="$(VC_VERIFIER_PUBLIC_URL)"; \
 	if [ -f .env.tunnel ]; then \
 		. ./.env.tunnel; \
 		if [ -n "$${TUNNEL_VC_APIGW_URL:-}" ]; then _VC_APIGW_REG_URL="$$TUNNEL_VC_APIGW_URL"; fi; \
 		if [ -n "$${TUNNEL_VC_VERIFIER_URL:-}" ]; then _VC_VERIFIER_REG_URL="$$TUNNEL_VC_VERIFIER_URL"; fi; \
 	fi; \
-	curl -sf -X POST $(ADMIN_URL)/admin/tenants/$(TENANT_ID)/issuers \
-		-H "Authorization: Bearer $(ADMIN_TOKEN)" \
-		-H "Content-Type: application/json" \
-		-d "{\"credential_issuer_identifier\":\"$$_VC_APIGW_REG_URL\",\"visible\":true}" && \
-		echo "  $(GREEN)✓ VC issuer registered ($$_VC_APIGW_REG_URL)$(NC)" || \
-		echo "  $(YELLOW)Warning: Could not register VC issuer$(NC)"; \
-	curl -sf -X POST $(ADMIN_URL)/admin/tenants/$(TENANT_ID)/verifiers \
-		-H "Authorization: Bearer $(ADMIN_TOKEN)" \
-		-H "Content-Type: application/json" \
-		-d "{\"name\":\"VC Verifier\",\"url\":\"$$_VC_VERIFIER_REG_URL\"}" && \
-		echo "  $(GREEN)✓ VC verifier registered ($$_VC_VERIFIER_REG_URL)$(NC)" || \
-		echo "  $(YELLOW)Warning: Could not register VC verifier$(NC)"
+	python3 scripts/bootstrap.py --admin-url "$(ADMIN_URL)" --admin-token "$(_EFFECTIVE_ADMIN_TOKEN)" \
+		--issuer-url "$$_VC_APIGW_REG_URL" --verifier-url "$$_VC_VERIFIER_REG_URL" --tenant "$(TENANT_ID)" || \
+		echo "  $(YELLOW)Warning: VC service registration failed - the wallet has no issuer/verifier until it succeeds$(NC)"
 
 # =============================================================================
 # Golden Release Resolution
@@ -879,20 +1234,61 @@ pki: ## Generate fresh PKI (signing keys and certificates)
 	@echo "$(GREEN)Generating PKI...$(NC)"
 	cd fixtures && ./create-pki.sh
 
+# WRPAC/WRPRC material comes from siros-wrpac-tool, a separate repo: under CIR
+# (EU) 2025/848 issuers and verifiers alike are registered wallet-relying
+# parties, each holding an access certificate and a registration certificate.
+# create-pki.sh cannot produce these - a WRPRC is a signed JWT against a
+# register, not something openssl can mint.
+#
+# Publishes the anchors as both a TS 119 602 LoTE and a TS 119 612 TSL, because
+# go-trust reads either and a real deployment has to support both.
+wrpac-pki: ## Generate WRPAC/WRPRC trust anchors and client certificates (needs ../siros-wrpac-tool)
+	@echo "$(GREEN)Generating WRPAC/WRPRC material...$(NC)"
+	cd fixtures && ./create-wrpac-pki.sh
+
+# Blind BBS needs its own key pair, and it cannot come from create-pki.sh:
+# a BBS secret is a BLS12-381 scalar consumed inside the signing algebra,
+# not an ECDSA key that signs a digest, so openssl cannot make one and no
+# PKCS#11 HSM can hold one. zk-cred-bbs ships the generator.
+#
+# Both halves land in the gitignored fixtures/vc-pki/, like every other
+# private key here, and an environment picks them up from there via its
+# bbs_public_key_file / bbs_secret_key_file keys (see environments/bbs.yaml)
+# - nothing has to be pasted anywhere afterwards.
+bbs-keys: ## Generate the issuer's blind BBS key pair into fixtures/vc-pki/
+	@echo "$(GREEN)Generating blind BBS issuer key pair...$(NC)"
+	cd fixtures && ./create-bbs-keys.sh
+
 # =============================================================================
 # Helm-rendered config (PDP=helm) — see scripts/render-helm-config.py
 # =============================================================================
 
-render-helm-config: ## Render wallet-backend/PDP config from helm-charts/siros-id-stack (use ANDROID_APPS=pkg=fingerprint,... to add debug/Play Store keys)
-	@if [ ! -d "$(HELM_CHARTS_PATH)/siros-id-stack" ]; then \
-		echo "$(RED)Error: helm-charts repo not found at $(HELM_CHARTS_PATH)$(NC)"; \
-		echo "  Run: make setup   (clones all required sibling repos)"; \
-		exit 1; \
-	fi
+vc-config-parity: ## Render chart/ for compose + fly-gdc and diff against fixtures/vc-config-golden (--update re-seeds; read the diff first)
+	@command -v helm >/dev/null 2>&1 || { echo "$(RED)Error: helm not found - https://helm.sh/docs/intro/install/$(NC)"; exit 1; }
+	python3 scripts/vc-config-parity.py --chart-dir "$(CHART_PATH)" $(PARITY_ARGS)
+
+render-helm-config: ## Render wallet-backend/PDP/vc-services config from the in-repo chart (chart/) (ANDROID_APPS=pkg=fingerprint,... adds debug/Play Store keys; ENV=<name> layers environments/<name>.yaml)
+	@command -v helm >/dev/null 2>&1 || { echo "$(RED)Error: helm not found - this renders config via 'helm template' - https://helm.sh/docs/intro/install/$(NC)"; exit 1; }
 	@_HASHES=$$(python3 scripts/android_apps.py --apk-key-hashes $(if $(ANDROID_APPS),--android-app "$(ANDROID_APPS)") 2>/dev/null); \
 	_FLAGS=""; \
 	for h in $$_HASHES; do _FLAGS="$$_FLAGS --android-apk-key-hash $$h"; done; \
-	python3 scripts/render-helm-config.py --chart-dir "$(HELM_CHARTS_PATH)/siros-id-stack" $$_FLAGS
+	for h in $(VC_HOSTNAMES); do _FLAGS="$$_FLAGS --hostname $$h"; done; \
+	$(if $(call _truthy,$(CONFORMANCE)),_FLAGS="$$_FLAGS --hostname issuer=vc-proxy:8443 --hostname issuerRegistry=vc-proxy:8445";) \
+	if [ -n "$(call _truthy,$(TUNNELS))" ] && [ -f .env.tunnel ]; then \
+		. ./.env.tunnel; \
+		for h in "issuer=$${TUNNEL_VC_APIGW_URL#https://}" \
+		         "verifier=$${TUNNEL_VC_VERIFIER_URL#https://}" \
+		         "walletFrontend=$${TUNNEL_FRONTEND_URL#https://}" \
+		         "walletBackend=$${TUNNEL_BACKEND_URL#https://}"; do \
+			case "$$h" in *=) ;; *) _FLAGS="$$_FLAGS --hostname $$h" ;; esac; \
+		done; \
+	fi; \
+	python3 scripts/render-helm-config.py --chart-dir "$(CHART_PATH)" $$_FLAGS \
+		--dc-api-enable "$(if $(call _truthy,$(DC_API)),true,false)" \
+		$(if $(MINI_OIDC_URL),--mini-oidc-url "$(MINI_OIDC_URL)") \
+		$(if $(_REGISTRY_EXTERNAL),--credential-registries "$(CREDENTIAL_REGISTRIES)") \
+		$(if $(ENV),--env "$(ENV)" --env-values) \
+		$(if $(ZK_CIRCUITS_SOURCES),--zk-circuits-source "$(ZK_CIRCUITS_SOURCES)")
 
 # =============================================================================
 # Fly.io — named ephemeral environments (see scripts/fly-up.py, fly-down.py)
@@ -900,29 +1296,49 @@ render-helm-config: ## Render wallet-backend/PDP config from helm-charts/siros-i
 
 WALLET_ATTESTATION ?= yes
 
-fly-up: ## Deploy a named Fly.io environment (make fly-up ENV=<name> [IMAGES=comp=ref,...] [ANDROID_APPS=pkg=fingerprint,...] [CONFORMANCE=yes] [TRUSTED_ISSUERS=url,...] [WALLET_ATTESTATION=no, default: yes])
+fly-up: ## Deploy a named Fly.io environment (make fly-up ENV=<name> [REGION=<code>] [IMAGES=comp=ref,...] [ANDROID_APPS=pkg=fingerprint,...] [CONFORMANCE=yes] [TRUSTED_ISSUERS=url,...] [TRUSTED_VERIFIERS=identity,...] [TRUSTED_VERIFIER_ROOTS=path,...] [ZK_CIRCUITS_SOURCES=url,...] [RICAL_PROVIDER_URL=url] [RICAL_ROOT_CERT=path] [WALLET_ATTESTATION=no, default: yes] [DC_API_ENABLE=true|false]) - if environments/<name>.yaml exists, its persisted defaults are merged in first (see `make env-show ENV=<name>`); CLI flags here add to/override it for this run only
 	@if [ -z "$(ENV)" ]; then \
 		echo "$(RED)Error: ENV=<name> is required, e.g. make fly-up ENV=demo1$(NC)"; \
 		exit 1; \
 	fi
-	@if [ ! -d "$(HELM_CHARTS_PATH)/siros-id-stack" ]; then \
-		echo "$(RED)Error: helm-charts repo not found at $(HELM_CHARTS_PATH)$(NC)"; \
-		echo "  Run: make setup   (clones all required sibling repos)"; \
-		exit 1; \
-	fi
 	@command -v flyctl >/dev/null 2>&1 || { echo "$(RED)Error: flyctl not found - https://fly.io/docs/flyctl/install/$(NC)"; exit 1; }
-	python3 scripts/fly-up.py --env "$(ENV)" --chart-dir "$(HELM_CHARTS_PATH)/siros-id-stack" --images "$(IMAGES)" \
+	@command -v helm >/dev/null 2>&1 || { echo "$(RED)Error: helm not found - fly-up renders config via 'helm template' - https://helm.sh/docs/intro/install/$(NC)"; exit 1; }
+	python3 scripts/fly-up.py --env "$(ENV)" --chart-dir "$(CHART_PATH)" --images "$(IMAGES)" \
 		$(if $(ANDROID_APPS),--android-app "$(ANDROID_APPS)") \
 		$(if $(call _truthy,$(CONFORMANCE)),--conformance) \
 		$(if $(TRUSTED_ISSUERS),--trusted-issuer "$(TRUSTED_ISSUERS)") \
-		$(if $(call _truthy,$(WALLET_ATTESTATION)),--wallet-attestation)
+		$(if $(TRUSTED_VERIFIERS),--trusted-verifier "$(TRUSTED_VERIFIERS)") \
+		$(if $(TRUSTED_VERIFIER_ROOTS),--trusted-verifier-root "$(TRUSTED_VERIFIER_ROOTS)") \
+		$(if $(ZK_CIRCUITS_SOURCES),--zk-circuits-source "$(ZK_CIRCUITS_SOURCES)") \
+		$(if $(RICAL_PROVIDER_URL),--rical-provider-url "$(RICAL_PROVIDER_URL)") \
+		$(if $(RICAL_ROOT_CERT),--rical-root-cert "$(RICAL_ROOT_CERT)") \
+		$(if $(call _truthy,$(WALLET_ATTESTATION)),--wallet-attestation) \
+		$(if $(DC_API_ENABLE),--dc-api-enable "$(DC_API_ENABLE)") \
+		$(if $(call _truthy,$(SINGLE_MACHINE)),--single-machine) \
+		$(if $(_REGISTRY_EXTERNAL),--credential-registries "$(CREDENTIAL_REGISTRIES)")
+		$(if $(REGION),--region "$(REGION)")
 
-fly-down: ## Tear down a named Fly.io environment (make fly-down ENV=<name>)
+fly-stop: ## Stop every machine of a Fly environment but keep its apps and data (make fly-stop ENV=<name> [ORG=<org>]); fly-start brings it back
+	@if [ -z "$(ENV)" ]; then echo "$(RED)Error: ENV=<name> is required$(NC)"; exit 1; fi
+	python3 scripts/fly-power.py stop --env "$(ENV)" $(if $(ORG),--org "$(ORG)") $(if $(call _truthy,$(SINGLE_MACHINE)),--single-machine)
+
+fly-start: ## Start a stopped Fly environment, in deploy order, waiting for health (make fly-start ENV=<name> [ORG=<org>])
+	@if [ -z "$(ENV)" ]; then echo "$(RED)Error: ENV=<name> is required$(NC)"; exit 1; fi
+	python3 scripts/fly-power.py start --env "$(ENV)" $(if $(ORG),--org "$(ORG)") $(if $(call _truthy,$(SINGLE_MACHINE)),--single-machine)
+
+fly-down: ## Tear down a named Fly.io environment (make fly-down ENV=<name> [KEEP_DATA=yes] - KEEP_DATA leaves the Mongo apps and their volumes, machines stopped, so the next fly-up finds the data again)
 	@if [ -z "$(ENV)" ]; then \
 		echo "$(RED)Error: ENV=<name> is required, e.g. make fly-down ENV=demo1$(NC)"; \
 		exit 1; \
 	fi
-	python3 scripts/fly-down.py --env "$(ENV)"
+	python3 scripts/fly-down.py --env "$(ENV)" $(if $(call _truthy,$(KEEP_DATA)),--keep-data) $(if $(call _truthy,$(SINGLE_MACHINE)),--single-machine)
+
+fly-storage-clear: ## Wipe a Fly environment's data through its env-admin app and re-register issuer/verifier (make fly-storage-clear ENV=<name>)
+	@if [ -z "$(ENV)" ]; then \
+		echo "$(RED)Error: ENV=<name> is required, e.g. make fly-storage-clear ENV=demo1$(NC)"; \
+		exit 1; \
+	fi
+	python3 scripts/storage.py clear --target fly --env "$(ENV)" $(if $(call _truthy,$(YES)),--yes)
 
 fly-status: ## Show Fly app status for a named environment (make fly-status ENV=<name>)
 	@if [ -z "$(ENV)" ]; then \
@@ -934,15 +1350,18 @@ fly-status: ## Show Fly app status for a named environment (make fly-status ENV=
 		echo ""; \
 	done
 
+env-show: ## Print a named environment's persisted config (make env-show ENV=<name>) - what `make fly-up ENV=<name>` will merge in from environments/<name>.yaml, if any
+	@if [ -z "$(ENV)" ]; then \
+		echo "$(RED)Error: ENV=<name> is required, e.g. make env-show ENV=gdc$(NC)"; \
+		exit 1; \
+	fi
+	python3 scripts/env_config.py --env "$(ENV)"
+
 # =============================================================================
 # Setup — clone sibling repositories
 # =============================================================================
 
 # repo:branch pairs — override GITHUB_ORG to use a different remote
-# helm-charts is NOT in this list - it's consumed read-only as a config-
-# rendering source (PDP=helm), not branched for local feature work like the
-# repos below, so it gets its own clone-or-update step in `setup` instead of
-# the generic "exists -> leave alone" handling.
 SETUP_REPOS := \
 	wallet-frontend:release/sirosid \
 	wallet-common:release/sirosid \
@@ -951,7 +1370,7 @@ SETUP_REPOS := \
 	vc:main \
 	facetec-api:main
 
-setup: ## Clone sibling repos needed for local development
+setup: ## Bootstrap a checkout: clone the sibling repos, install the boot manager into .venv and launch it (NO_LAUNCH=yes to skip the launch)
 	@echo "$(GREEN)Setting up sibling repositories...$(NC)"
 	@for entry in $(SETUP_REPOS); do \
 		repo=$${entry%%:*}; \
@@ -966,38 +1385,59 @@ setup: ## Clone sibling repos needed for local development
 				printf "  %-24s $(RED)failed$(NC)\n" "$$repo"; \
 		fi; \
 	done
-	@# helm-charts: clone if missing; if present and on main, fast-forward it -
-	@# a stale chart would silently render outdated/wrong config for PDP=helm.
-	@# Left alone (with a note) if checked out to something other than main,
-	@# e.g. a PR branch someone's deliberately testing against.
-	@if [ -d "$(HELM_CHARTS_PATH)" ]; then \
-		branch="$$(git -C $(HELM_CHARTS_PATH) branch --show-current 2>/dev/null)"; \
-		if [ "$$branch" = "main" ]; then \
-			if git -C $(HELM_CHARTS_PATH) fetch origin --quiet && \
-				git -C $(HELM_CHARTS_PATH) pull --ff-only --quiet; then \
-				printf "  %-24s $(GREEN)updated$(NC) (main)\n" "helm-charts"; \
-			else \
-				printf "  %-24s $(RED)update failed$(NC) (main - check for local changes)\n" "helm-charts"; \
-			fi; \
-		else \
-			printf "  %-24s $(YELLOW)exists$(NC) (on '%s', not main — skipping auto-update)\n" "helm-charts" "$$branch"; \
-		fi; \
-	else \
-		echo "  Cloning helm-charts (branch main)..."; \
-		git clone -b main "$(GITHUB_ORG)/helm-charts.git" "$(HELM_CHARTS_PATH)" && \
-			printf "  %-24s $(GREEN)cloned$(NC) (main)\n" "helm-charts" || \
-			printf "  %-24s $(RED)failed$(NC)\n" "helm-charts"; \
-	fi
+	@$(MAKE) --no-print-directory _install-bootmgr
 	@echo ""
-	@echo "$(GREEN)Done.$(NC) Run 'make install' to install dependencies, then 'make up' to start the stack."
+	@echo "$(GREEN)Done.$(NC) Launch the boot manager any time with 'make boot', or 'make up' to start the stack directly."
+	@if [ -t 0 ] && [ -z "$(NO_LAUNCH)" ]; then "$(VENV)/bin/sirosid-dev"; fi
 
-# =============================================================================
-# Dependency Installation
-# =============================================================================
+# The boot manager (bootmgr/, a Textual TUI over everything in this Makefile)
+# is part of `make setup` - one bootstrap target, not two. Kept as its own
+# hidden step so setup's clone loop and the venv install stay readable.
+VENV ?= .venv
 
-install: ## Install all project dependencies
-	@echo "$(GREEN)No npm dependencies required.$(NC)"
-	@echo "$(GREEN)run-android-conformance.mjs uses only built-in Node.js modules.$(NC)"
+_install-bootmgr:
+	@command -v python3 >/dev/null 2>&1 || { echo "$(RED)Error: python3 not found$(NC)"; exit 1; }
+	@if [ ! -x "$(VENV)/bin/python" ]; then \
+		echo "$(GREEN)Creating $(VENV)...$(NC)"; \
+		python3 -m venv "$(VENV)" || { echo "$(RED)python3 -m venv failed - on Debian/Ubuntu: sudo apt install python3-venv$(NC)"; exit 1; }; \
+	fi
+	@echo "$(GREEN)Installing the boot manager into $(VENV)...$(NC)"
+	@"$(VENV)/bin/pip" install --quiet --upgrade pip
+	@"$(VENV)/bin/pip" install --quiet -e ./bootmgr
+	@echo "$(GREEN)Boot manager installed$(NC) ($(VENV)/bin/sirosid-dev)"
+
+boot: ## Launch the boot manager (run `make setup` first)
+	@if [ ! -x "$(VENV)/bin/sirosid-dev" ]; then \
+		echo "$(RED)Boot manager not installed - run: make setup$(NC)"; exit 1; \
+	fi
+	@"$(VENV)/bin/sirosid-dev"
+
+storage-status: ## Show every store the local stack has: mode (volume/memory), size, whether it persists (ENV=<name> to use that environment's options)
+	@python3 scripts/storage.py status --target local $(if $(ENV),--env "$(ENV)")
+
+storage-clear: ## Wipe the local stack's data and re-register issuer/verifier - via env-admin while the stack is up (no restart of the stack needed), via the volumes when it is down (YES=yes skips the prompt)
+	@python3 scripts/storage.py clear --target local $(if $(ENV),--env "$(ENV)") $(if $(call _truthy,$(YES)),--yes)
+
+# vc-apigw's datastore API (/api/v1/datastore/*) takes a Bearer JWT signed
+# with the per-target key scripts/api_auth.py generates at render time;
+# these mint it from the rendered config. ENV=<name> targets that Fly
+# environment, otherwise the local stack.
+datastore-token: ## Print a short-lived admin token for vc-apigw's /api/v1 (ENV=<name> for a Fly environment)
+	@python3 scripts/datastore.py $(if $(ENV),--env "$(ENV)") token
+
+datastore-search: ## List vc-apigw datastore documents (SCOPE=<scope> to filter, ENV=<name> for a Fly environment)
+	@python3 scripts/datastore.py $(if $(ENV),--env "$(ENV)") search $(if $(SCOPE),--scope "$(SCOPE)")
+
+datastore-upload: ## Add bootstrapping documents to a running environment without a wipe: FILE=fixtures/vc-bootstrapping/<scope>.json (ENV=<name> for a Fly environment)
+	@test -n "$(FILE)" || { echo "usage: make datastore-upload FILE=fixtures/vc-bootstrapping/<scope>.json [ENV=<name>]"; exit 2; }
+	@python3 scripts/datastore.py $(if $(ENV),--env "$(ENV)") upload "$(FILE)"
+
+datastore-offer: ## Mint a pre-authorized credential offer for cross-device issuance: SCOPE=<scope> [DOCUMENT_ID=<id>] [QR=yes] [ENV=<name>]
+	@test -n "$(SCOPE)" || { echo "usage: make datastore-offer SCOPE=<scope> [DOCUMENT_ID=<id>] [QR=yes] [ENV=<name>]"; exit 2; }
+	@python3 scripts/datastore.py $(if $(ENV),--env "$(ENV)") offer --scope "$(SCOPE)" $(if $(DOCUMENT_ID),--document-id "$(DOCUMENT_ID)") $(if $(QR),--qr)
+
+datastore-sync: ## Make a running environment's datastore and identity mappings match fixtures/vc-bootstrapping (DRY_RUN=yes to preview, SCOPE=<scope> to narrow, ENV=<name> for a Fly environment)
+	@python3 scripts/datastore.py $(if $(ENV),--env "$(ENV)") sync $(if $(SCOPE),--scope "$(SCOPE)") $(if $(DRY_RUN),--dry-run)
 
 # =============================================================================
 # R2PS Service
@@ -1045,6 +1485,7 @@ android-up: android-config ## Start Android overlay services (SDK_REBUILD=yes to
 	$(if $(call _truthy,$(SDK_REBUILD)),@./scripts/android-test.sh rebuild)
 	@docker compose -f docker-compose.test.yml \
 		-f docker-compose.vc-services.yml \
+		-f docker-compose.mongodb.yml \
 		-f docker-compose.go-trust.yml \
 		-f docker-compose.go-trust-allow.yml \
 		$(if $(call _truthy,$(R2PS)),-f docker-compose.r2ps.yml) \
@@ -1054,6 +1495,7 @@ android-up: android-config ## Start Android overlay services (SDK_REBUILD=yes to
 android-down: ## Stop Android overlay services
 	@docker compose -f docker-compose.test.yml \
 		-f docker-compose.vc-services.yml \
+		-f docker-compose.mongodb.yml \
 		-f docker-compose.go-trust.yml \
 		-f docker-compose.go-trust-allow.yml \
 		$(if $(call _truthy,$(R2PS)),-f docker-compose.r2ps.yml) \
@@ -1092,6 +1534,7 @@ usb-android-up: usb-android-config ## Start USB Android overlay services (SDK_RE
 	$(if $(call _truthy,$(SDK_REBUILD)),@./scripts/usb-android-test.sh rebuild)
 	@docker compose -f docker-compose.test.yml \
 		-f docker-compose.vc-services.yml \
+		-f docker-compose.mongodb.yml \
 		-f docker-compose.go-trust.yml \
 		-f docker-compose.go-trust-allow.yml \
 		$(if $(call _truthy,$(R2PS)),-f docker-compose.r2ps.yml) \
@@ -1102,6 +1545,7 @@ usb-android-up: usb-android-config ## Start USB Android overlay services (SDK_RE
 usb-android-down: ## Stop USB Android overlay services
 	@docker compose -f docker-compose.test.yml \
 		-f docker-compose.vc-services.yml \
+		-f docker-compose.mongodb.yml \
 		-f docker-compose.go-trust.yml \
 		-f docker-compose.go-trust-allow.yml \
 		$(if $(call _truthy,$(R2PS)),-f docker-compose.r2ps.yml) \

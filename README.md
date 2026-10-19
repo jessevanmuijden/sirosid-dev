@@ -32,16 +32,76 @@ Or if you already have the repos cloned:
 make up            # Start default stack (go-trust allow-all)
 make up VC=yes     # … with production-like VC services
 make up GOLDEN=yes # … using pre-built golden release images
+make plan VC=yes   # Show what `make up` would do, without starting anything
 make status        # Check all service health
 make logs          # View Docker logs
-make down          # Stop everything
+make down          # Stop everything (Mongo data is kept - see "Storage")
 make update        # Force-update all repos to upstream
 make help          # Full option reference
 ```
 
+## Boot manager
+
+The option matrix behind `make up`/`make fly-up` has grown large. The boot
+manager is a terminal UI over it, for finding your way rather than
+remembering flags:
+
+```bash
+make setup         # clones the sibling repos, installs the boot manager into .venv, launches it
+make boot        # afterwards
+```
+
+It lists every environment in one place (the unnamed local stack, every
+`environments/<name>.yaml`, every `sirosid-<env>-*` deployment found on
+Fly), shows what booting one means before you do it (compose files,
+storage, pre-flight checks), edits an environment's options as a form with
+the help text next to each field, boots/stops/redeploys, tails logs, runs a
+doctor over the known gotchas, and has a Storage panel with the same
+"Clear all data" the dashboard has. Every action is a `make` command it
+shows before running, so nothing it does is out of reach of the shell.
+
+`scripts/stack.py` is what makes this possible: the option matrix as data
+(`make plan` prints it), with `tests/test_stack_parity.py` asserting it
+agrees with the Makefile's own `COMPOSE_FILES` logic.
+
+## Storage
+
+Mongo data lives on named volumes that survive `make down`:
+
+| volume | holds |
+|---|---|
+| `sirosid-mongodb-data` | wallet-backend (`PDP=helm` only - every other mode is an in-memory store) and the VC services |
+| `sirosid-conformance-mongodb-data` | the OpenID conformance suite's own database |
+| `sirosid-r2ps-softhsm-tokens`, `sirosid-attest-softhsm-tokens` | SoftHSM2 tokens (`R2PS=yes`) |
+
+```bash
+make storage-status            # every store: mode, size, whether it persists
+make storage-clear             # wipe + re-register issuer/verifier (YES=yes skips the prompt)
+make clean                     # the old way: containers, volumes and build cache, all gone
+```
+
+Clearing goes through **env-admin** (`env-admin/`, a small service every
+`make up` starts; also `sirosid-<env>-env-admin` on Fly): it stops the
+Mongo consumers, drops the application databases, starts them again so
+they recreate their indexes and seed data, and re-registers the issuer and
+verifier with wallet-backend (`scripts/bootstrap.py`, the same code `make
+up` and `make fly-up` run). The dashboard's **Storage** card is the same
+action with a button, on both targets. When the stack is down there is no
+env-admin, so `make storage-clear` removes the volumes instead.
+
+The button needs the environment's admin token plus the environment name
+typed as confirmation. A loopback-only local stack embeds the token in the
+gitignored `build-info.json` so the prompt is skipped; under `TUNNELS=yes`
+or `DOMAIN=` the dashboard is reachable from other machines, so the token is
+not embedded and the card prompts for it, as it always does on Fly.
+
+On Fly the same data sits on a Fly volume per Mongo app - see "Fly.io
+Deployment" for `KEEP_DATA=yes` and `make fly-storage-clear`.
+
 ## Prerequisites
 
 - Docker and Docker Compose
+- [`helm`](https://helm.sh/docs/intro/install/) (CLI only, no cluster needed) — required for `PDP=helm` and `make fly-up`; both render config via `helm template` against the in-repo `chart/`
 - The following sibling repositories cloned alongside `sirosid-dev`
   (not needed when using `GOLDEN=yes` with pre-built images):
   ```
@@ -52,7 +112,6 @@ make help          # Full option reference
   ├── go-trust/             # trust PDP
   ├── wallet-common/        # shared TypeScript types
   ├── vc/                   # VC services (optional, for VC=yes)
-  ├── helm-charts/          # production Helm chart (optional, for PDP=helm)
   └── facetec-api/          # FaceTec SDK bridge (optional, for FACETEC=yes)
   ```
 
@@ -68,7 +127,7 @@ For the full list of options, targets, and usage patterns, run:
 make help
 ```
 
-This shows all available parameters (PDP, VC, TRANSPORT, CONFORMANCE, R2PS, DOMAIN, GOLDEN, TUNNELS, FACETEC, ANDROID_APPS, WALLET_NAME, APP_PACKAGE),
+This shows all available parameters (PDP, AS_RULES, VC, TRANSPORT, CONFORMANCE, R2PS, DOMAIN, GOLDEN, TUNNELS, FACETEC, ANDROID_APPS, WALLET_NAME, APP_PACKAGE),
 interaction rules, and complete examples.
 
 ## Quickstart Examples
@@ -244,7 +303,55 @@ adb shell am compat enable DEVELOPMENT_PASSKEY_REGISTRATION org.siros.sdk.sample
 | `PDP=whitelist` | go-trust whitelist — only entities in `fixtures/vc-go-trust-whitelist.yaml` are trusted |
 | `PDP=deny` | go-trust deny-all — rejects everything (negative testing) |
 | `PDP=mock` | Legacy mock-trust-pdp (no go-trust) |
-| `PDP=helm` | go-trust whitelist + wallet-backend, both configured from config files rendered off `helm-charts/siros-id-stack` (see `scripts/render-helm-config.py`) instead of hand-maintained env vars/flags. Requires a sibling `../helm-charts` checkout. This is the transitional step towards aligning sirosid-dev's config with the production Helm chart — over time the other PDP modes' hand-maintained env vars are meant to be replaced by this path, not kept alongside it indefinitely. |
+| `PDP=helm` | go-trust whitelist + wallet-backend, both configured from config files rendered off the in-repo `chart/` (forked from [siros-id-stack](https://github.com/sirosfoundation/siros-id-stack)) (see `scripts/render-helm-config.py`) instead of hand-maintained env vars/flags. |
+
+### WRPAC/WRPRC registration (CIR (EU) 2025/848)
+
+Under CIR (EU) 2025/848 issuers and verifiers alike are **registered
+wallet-relying parties**: each holds an access certificate (**WRPAC**) saying
+who it is and a registration certificate (**WRPRC**) saying what it registered
+for. The wallet checks the WRPRC before requesting issuance (ARF v3.0.0
+§6.6.2.3) or releasing attributes.
+
+`create-pki.sh` cannot produce these — a WRPRC is a signed JWT against a
+register, not something openssl can mint — so the material comes from
+[siros-wrpac-tool](https://github.com/sirosfoundation/siros-wrpac-tool):
+
+```sh
+# v0.2.0 or later: the tsl command arrived there
+git clone git@github.com:sirosfoundation/siros-wrpac-tool.git ../siros-wrpac-tool
+make -C ../siros-wrpac-tool build
+
+make wrpac-pki
+docker compose -f docker-compose.test.yml -f docker-compose.wrpac.yml up -d
+```
+
+This mints a WRPAC and WRPRC for the local `vc-issuer` and `vc-verifier` from
+the specs in `fixtures/wrpac-clients/`, and publishes the deployment's trust
+anchors in **both** list formats — an ETSI TS 119 602 LoTE and an ETSI TS 119
+612 TSL — because go-trust reads either and a real deployment has to support
+both. `go-trust-wrpac` on port 9099 is configured with both registries.
+
+| File | Description |
+|------|-------------|
+| `fixtures/wrpac-clients/*.yaml` | Per-party registration specs; the filename stem is the client id |
+| `fixtures/wrpac-pki/` | The deployment: CA key, register, CRL number, status list indices. Gitignored and **must persist** — reusing a status index would transfer a previous holder's revocation to a new certificate |
+| `fixtures/go-trust-wrpac.yaml` | go-trust with both the `lote` and `etsi` registries pointed at the published anchors |
+
+Each client keeps its own key: only a CSR reaches the deployment, which
+certifies the public key and never holds the private half.
+
+### AS (Authorization Server) Rules
+
+`AS_RULES=` selects the SPOCP policy wallet-backend's built-in Authorization
+Server (passkey login + token endpoint) evaluates token requests against —
+independent of the `PDP=` trust policy above, which governs issuer/verifier
+trust rather than AS token issuance.
+
+| Mode | Description |
+|------|--------------|
+| `AS_RULES=allow-all` (default) | Unconditional allow (`fixtures/as-rules/allow-all.rules`) — `make up`'s job is to give every other feature a working AS out of the box, not to exercise the AS ruleset itself. |
+| `AS_RULES=baseline` | go-wallet-backend's own real baseline policy (`rules/default.rules` + `rules/delegation.rules`, the same rules baked into every image and used by `make fly-up`, which never overrides `WALLET_AS_RULES_DIR`). Use this only when directly testing AS rule behavior — e.g. reproducing a Fly-only 403 locally, or checking a new client request shape against the real policy — see `docker-compose.as-rules-baseline.yml`. |
 
 ## VC Services
 
@@ -253,7 +360,153 @@ services built from the `../vc` source repository. On startup, the issuer
 and verifier are automatically registered with the wallet backend via the
 admin API — no manual registration needed.
 
-Available credentials: PID (ARF 1.5 + 1.8), EHIC, Diploma.
+Available credentials: PID (ARF 1.5 + 1.8), EHIC, Diploma, SIROS ID, mDL and
+PID as mdoc, and the EU Business Wallet attestations below.
+
+### Synthetic test data
+
+Most types are **datastore-sourced**: the credential is built from a document
+in `fixtures/vc-bootstrapping/<scope>.json`, one file per scope, keyed by
+mini-oidc user id. (`pid_1_5` and `ehic` are the exceptions - they are
+assertion-sourced, built from the mini-oidc claims at issuance time, and have
+no file.) Three rules hold across that directory, each with a test in
+`tests/test_fixture_integrity.py` behind it:
+
+**The person in the document is the person who logs in.** `identity_mappings.
+json` is the bridge: PID-authenticated issuance resolves the holder by
+matching the presented PID's `given_name`/`family_name`/`birth_date` against
+it, so a document whose name or birth date drifts from mini-oidc's
+`users.yaml` cannot be issued at all - and the error is "no documents", which
+reads like a missing fixture rather than a mismatched one.
+
+**Every claim a document carries is declared** by that type's VCTM
+(`fixtures/vc-metadata/vctm_<scope>.json`) or MDDL schema
+(`<scope>.mdoc.json`). Issuing an undeclared claim is silently dropped or
+rejected depending on the issuer.
+
+**Each scope has a minimal document and exactly one maximal one.** The maximal
+document's `meta.document_id` ends in **`-full`** (e.g.
+`document_id_pid_1_8_carol-003-full`) and covers the type's mandatory *and*
+every optional claim; the others cover the mandatory claims only, and are the
+typical case. One holder owns the `-full` document per scope - a holder with
+two documents of the same scope would make issuance ambiguous, since nothing
+picks between them.
+
+| scope | minimal | `-full` |
+|---|---|---|
+| `pid_1_8` | alice-001, bob-002, erik-010, maria-011, jan-012, sophie-013 | carol-003 |
+| `mdl` | alice-001, bob-002 | carol-003 |
+| `siros_id` | alice-001, bob-002 | carol-003 |
+| `diploma` | alice-001, bob-002 | carol-003 |
+| `pid_mdoc` | alice-001 | bob-002 |
+| `mdl_zk4` | alice-001 | bob-002 |
+| `photoid` | alice-001, bob-002 | carol-003 |
+| `ebw_oid` | erik-010, maria-011 | sophie-013 |
+| `eucc` | erik-010, maria-011, jan-012 | sophie-013 |
+| `eu_poa` | jan-012 | sophie-013 |
+| `iban_ov` | erik-010, maria-011, jan-012 | sophie-013 |
+| `nym_auth` | alice-001, bob-002 | carol-003 |
+
+Derived claims (`age_in_years`, `age_birth_year`, `age_over_18/21/65`,
+`age_equal_or_over.*`) are recomputed from the birth date **at test time**, so
+a value that has fallen behind fails the suite instead of issuing a wrong
+credential. When one does, update the fixture - that is the test working.
+
+`mdl_zk4`'s `-full` document is also the one to use for Vega ZK testing: it is
+the only one that fills all four of the circuit's fixed attribute slots.
+
+### EU Business Wallet attestations
+
+Four WE BUILD rulebook types for testing an EU Business Wallet, declared in
+`values-base.yaml` and served from VCTMs copied out of
+[registry.siros.org](https://registry.siros.org) (`webuild-consortium/`):
+
+| scope | vct | what |
+|---|---|---|
+| `ebw_oid` | `uri:eu.ebw.oid.1` | Owner Identification Data (ds001) - which legal person owns the wallet |
+| `eucc` | `urn:eudi:eucc:1` | EU Company Certificate (ds004) - the business-register extract |
+| `eu_poa` | `uri:eu.eudi.eu-poa.1` | EU Power of Attorney (ds007) - principal grants an attorney powers |
+| `iban_ov` | `eu.we-build.iban-ov.1` | IBAN Ownership Verification (rb-iban-ov) - the company's bank account |
+
+All four require **PID authentication**, as they would in a live setting.
+The wallet presents a PID (OpenID4VP during issuance) and the identity in it
+selects the person's documents from the datastore
+(`fixtures/vc-bootstrapping/{ebw_oid,eucc,eu_poa,iban_ov}.json`, mapped through
+`identity_mappings.json`). Get a PID first as a **company user** (pid_1_5
+works for every mini-oidc user), then request the attestation; the wallet asks
+you to present the PID and the document for that person is issued. The
+natural persons (alice, bob, carol) have no such documents, so their PID leads
+to "no documents". The same synthetic data also ships in mini-oidc 0.0.5's
+`users.yaml` (`attestations:`), for stacks that prefer OIDC-asserted issuance.
+
+vc-apigw imports these documents only into an **empty** datastore, so an
+environment that already holds data does not pick up a new type on redeploy.
+Add the documents to it without a wipe with
+`make datastore-upload FILE=fixtures/vc-bootstrapping/<scope>.json [ENV=<name>]`
+(`make datastore-search SCOPE=<scope>` to check). The admin API behind those
+targets takes a Bearer token signed with a per-environment key the render step
+generates; see `scripts/api_auth.py`.
+
+| mini-oidc user | company | EBW-OID | EUCC | EU PoA | IBAN-OV |
+|---|---|---|---|---|---|
+| erik-010 | Nordic Tech Solutions AB (SE), sole representative | yes | yes | | SEB account |
+| maria-011 | Grünberg Consulting GmbH (DE), joint representative | yes | yes | | Deutsche Bank account |
+| jan-012 | Grünberg Consulting GmbH employee | | yes | attorney, principal Maria | Deutsche Bank account |
+| sophie-013 | Transport Dubois SARL (FR), sole manager | yes | yes | attorney, principal co-founder | BNP Paribas account |
+
+Every company user also has a PID (`pid_1_8`), which they need before any of
+these can be issued: the attestations above are PID-authenticated, so a user
+without one cannot start the flow at all.
+
+
+The verifier has matching presentation-request templates in
+`fixtures/vc-presentation-requests/eu_business_wallet.yaml`.
+
+### nym_auth (Nym-authentication attestation)
+
+`nym_auth` is the natural-person attestation of the
+[Nym-authentication rulebook](https://github.com/sirosfoundation/nym_auth_rulebook)
+(v0.3): an `mso_mdoc` whose doctype and namespace are both
+`eu.europa.ec.eudi.nym_auth.1`, carrying `birth_date` (full-date, tag 1004),
+`ssc` - SHA-256 of a 16-byte `secret_seed` the issuer and the prover share -
+and optionally `psc` (SHA-256 of a prover-only seed). It exists for
+`circuit_zk` presentations: pseudonyms and age predicates proven in zero
+knowledge, never disclosed. `fixtures/vc-metadata/nym_auth.mdoc.json` is a
+byte-for-byte copy of the rulebook's schema until registry.siros.org
+publishes it (mdoc types stay vendored even with `REGISTRY=external`).
+
+**Who can get it:** alice-001, bob-002 and carol-003
+(`fixtures/vc-bootstrapping/nym_auth.json`; carol-003's is the `-full`
+document, with `psc`). **How:** request `nym_auth` in the wallet; the issuer
+asks, during OpenID4VCI, for any one of a PID (`pid_1_8` or `pid_1_5`, SD-JWT),
+a `pid_mdoc`, an `mdl` or a `photoid`, and the person in it selects the
+document through `identity_mappings.json`. Get one of those first.
+
+**Birth date.** The issued `birth_date` is meant to be **copied from the
+presented credential** (normalised to `YYYY-MM-DD`: an SD-JWT PID's
+`birthdate`, an mdoc's tag-1004 `birth_date`). vc main cannot copy a presented
+claim into a datastore-sourced credential, so values-base.yaml also renders
+`auth_scopes.<x>.document_claims` (and `identity_attributes`, which lets the
+`pid_mdoc`/`photoid` options resolve a person) for a proposed vc change; vc
+main ignores both keys and issues the document's own `birth_date`, which
+`tests/test_fixture_integrity.py` holds equal to the birth date in every
+credential the person can present. With vc main only the `pid_1_8`, `pid_1_5`
+and `mdl` options resolve a person; `pid_mdoc` stays unusable even with the vc
+change until our `pid_mdoc` schema carries a `birth_date`.
+
+**`ssc`/`psc` are TEMPORARY test commitments until SUNET/vc supports them**
+(per-holder seed, commitment, seed delivery). Every document carries the
+same values, from public test seeds - so every holder derives the same
+pseudonyms: good for testing a circuit, useless for testing unlinkability or
+known-offender matching. `fixtures/vc-bootstrapping/nym_auth.json` is the one
+place to change when vc can do better.
+
+| claim | test seed (hex, 16 bytes) | commitment (standard base64 of SHA-256(seed), as the datastore stores a bstr) |
+|---|---|---|
+| `ssc` | `000102030405060708090a0b0c0d0e0f` | `vkXLJgW/Nr695oSEGijw/UPGmFCj3OX+26aZKO46iZE=` |
+| `psc` (carol-003 only) | `101112131415161718191a1b1c1d1e1f` | `/C4scwcr+ivaA/+TB0ct69PMgQUCioqeI141uo0uN/Q=` |
+
+Recompute: `python3 -c "import hashlib,base64,sys;print(base64.b64encode(hashlib.sha256(bytes.fromhex(sys.argv[1])).digest()).decode())" 000102030405060708090a0b0c0d0e0f`
 
 ### Service Architecture
 
@@ -325,7 +578,7 @@ environment variables or on the command line:
 | `VC_PATH` | `../vc` | VC services source |
 | `GO_TRUST_PATH` | `../go-trust` | go-trust source |
 | `FACETEC_PATH` | `../facetec-api` | facetec-api source (`FACETEC=yes` only) |
-| `HELM_CHARTS_PATH` | `../helm-charts` | helm-charts source (`PDP=helm` / `make fly-up` only) |
+| `CHART_PATH` | `chart` | config chart rendered by `helm template` (in this repo) |
 | `WALLET_NAME` | `SIROS ID (dev)` | Wallet display name |
 
 ```bash
@@ -460,17 +713,30 @@ Spin up a full, independently addressable wallet stack (frontend, wallet-proxy,
 backend, PDP, issuer, verifier, apigw, registry, mongo, mini-oidc) on Fly.io
 under the shared `sirosfoundation` org - each named environment gets its own set of
 `sirosid-<env>-*` apps and `*.fly.dev` URLs, fully isolated from every other
-environment. Config is rendered from `helm-charts/siros-id-stack` (same
+environment. Config is rendered from the in-repo `chart/` (same
 mechanism as `PDP=helm`, see below) and images are pulled straight from that
 chart's `values.yaml` - no local Docker build.
 
 ```bash
 make fly-up ENV=alice              # deploy a new environment
-make fly-status ENV=alice          # check all 10 apps
-make fly-down ENV=alice            # tear it down
+make fly-status ENV=alice          # check all 11 apps
+make fly-down ENV=alice            # tear it down (deletes the Mongo data too)
+make fly-down ENV=alice KEEP_DATA=yes   # tear down but keep the Mongo apps + volumes, machines stopped
+make fly-storage-clear ENV=alice   # wipe the data through env-admin (or the volumes, if down)
 ```
 
-Requires `flyctl` installed and authenticated, and a sibling `../helm-charts`
+Mongo data persists on a Fly volume (one per Mongo app, created by `fly-up`
+if missing), so a redeploy, an image bump or a Fly host restart no longer
+empties the environment. Two consequences: the Mongo root password is now
+cached per environment in `fixtures/rendered/fly-<env>/` and recovered from
+the running machine over `fly ssh console` when that cache is missing
+(another developer redeploying), and a volume pins its app to a region -
+`fly-up` refuses to move an environment with data rather than silently
+orphaning it. The dashboard's Storage card and `make fly-storage-clear` go
+through the environment's `env-admin` app, which restarts the Mongo
+consumers with one app-scoped Fly deploy token per consumer app.
+
+Requires `flyctl` installed and authenticated, and the in-repo `chart/`
 checkout (`make setup` clones it).
 
 ### Multiple developers, multiple environments
@@ -516,7 +782,7 @@ they're not redundant, each solves a problem the other can't:
 
 - **`values-fly.yaml`'s `images:` block (shared default, checked in)** -
   pins several components (currently `images.pdp`, `images.walletBackend`,
-  and the four `vc.*` image keys) ahead of `helm-charts`' own, slower-moving
+  and the four `vc.*` image keys) ahead of `siros-id-stack`'s own, slower-moving
   pins, each because this repo needs a fix or feature the chart hasn't
   caught up to yet - e.g. the `images.pdp` override exists because the
   chart's own pin predates a fix
@@ -530,7 +796,7 @@ they're not redundant, each solves a problem the other can't:
 
   Every entry in that file's `images:` block carries its own comment naming
   the exact upstream condition under which it should be deleted (e.g. "once
-  helm-charts bumps images.pdp past vX.Y.Z") - read `values-fly.yaml`
+  siros-id-stack bumps images.pdp past vX.Y.Z") - read `values-fly.yaml`
   directly for the current pinned versions and per-override rationale
   rather than trusting a version number here; this prose already drifted
   out of sync with the file once and will again.
@@ -581,8 +847,13 @@ sirosid-dev/
 │                                  # images, transports, FaceTec, helm-config)
 │                                  # -- run `make help` for which flag adds
 │                                  # which overlay; there are ~30 of these
-├── nginx-e2e.conf                 # Frontend nginx config (dashboard + health proxies)
+├── nginx-e2e.conf                 # Frontend nginx config (dashboard + health + env-admin proxies)
+├── startup.html, dashboard/       # The local dashboard, and the Storage card both dashboards share
 ├── values-dev.yaml / values-fly.yaml   # Helm values overlays for render-helm-config.py
+├── environments/                  # Persisted per-environment config (Fly + local: block)
+├── env-admin/                     # The in-environment storage-reset service (local + Fly)
+├── bootmgr/                       # The boot manager TUI (installed by make setup, run by make boot)
+├── tests/                         # unittest suites: stack parity, env-admin, Fly storage
 ├── fixtures/                      # VC/PDP config templates, PKI, presentation requests
 ├── mocks/                         # mock-verifier (OpenID4VP) + trust-pdp (legacy AuthZEN) mocks
 └── scripts/                       # All Makefile-invoked automation (Fly deploy, Android/USB
@@ -635,3 +906,4 @@ cd sirosid-tests && make test-conformance
 - [wallet-frontend](https://github.com/wwWallet/wallet-frontend) — Web wallet UI
 - [go-trust](https://github.com/sirosfoundation/go-trust) — Trust PDP
 - [SUNET/vc](https://github.com/SUNET/vc) — VC services (issuer, verifier, registry)
+- [siros-id-stack](https://github.com/sirosfoundation/siros-id-stack) — Origin of `chart/` (production Helm chart; ported from by hand) (`PDP=helm` / `make fly-up`)

@@ -69,12 +69,12 @@ USB_FORWARD_PORTS="${USB_FORWARD_PORTS:-3000 8080 8081 8082 8443 9000 9001 9003 
 COMPOSE_FILES=(
     -f docker-compose.test.yml
     -f docker-compose.vc-services.yml
+    -f docker-compose.mongodb.yml
     -f docker-compose.go-trust.yml
     -f docker-compose.go-trust-allow.yml
     -f docker-compose.android-usb.yml
 )
 
-ANDROID_CONFIG_SCRIPT="${DEVENV_DIR}/scripts/generate-android-config.py"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -211,17 +211,21 @@ do_register_issuer() {
 }
 
 do_generate_config() {
-    info "Generating USB Android VC config (gateway=localhost via adb reverse)..."
+    info "Rendering USB Android VC config from the in-repo chart (gateway=localhost)..."
     if ! command -v python3 >/dev/null 2>&1; then
-        fail "python3 is required to generate fixtures/vc-config-android-usb.yaml"
+        fail "python3 is required to render the vc services' config"
         exit 1
     fi
 
     cd "$DEVENV_DIR"
-    python3 "$ANDROID_CONFIG_SCRIPT" \
-        --gateway "localhost" \
-        --output "fixtures/vc-config-android-usb.yaml"
-    ok "Generated fixtures/vc-config-android-usb.yaml"
+    # The apigw and mini-oidc have to be advertised at an address the device
+    # can actually reach, not the host's own localhost - everything else in
+    # the config follows from the chart. This used to be a separately
+    # pre-patched copy of the whole config file.
+    make --no-print-directory render-helm-config \
+        VC_HOSTNAMES="issuer=localhost:9003 walletBackend=localhost:8080 walletFrontend=localhost:3000" \
+        MINI_OIDC_URL="http://localhost:9005"
+    ok "Rendered fixtures/rendered/vc-*.yaml"
 }
 
 do_restart_backend() {
