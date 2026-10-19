@@ -608,10 +608,11 @@ and generates a `.env.golden` file with the resolved image tags.
 
 **Note:** When using `GOLDEN=yes VC=yes`, the wallet and go-trust services
 use golden images but VC services are still built from local source. This is
-because the VC configuration format (`fixtures/vc-config.yaml`) evolves
-between releases, making golden VC images incompatible with the current
-config. The golden VC overlay (`docker-compose.golden-vc.yml`) is available
-for future use once configs are version-aligned.
+because the VC config rendered from the chart (`values-base.yaml` into
+`fixtures/rendered/vc-*.yaml`) is written for current source and evolves
+between releases, making golden VC images incompatible with it. The golden VC
+overlay (`docker-compose.golden-vc.yml`) is available for future use once
+configs are version-aligned.
 
 Images are pulled from `ghcr.io/sirosfoundation/*` — you may need
 `docker login ghcr.io` if the images are not public.
